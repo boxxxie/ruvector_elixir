@@ -1,20 +1,20 @@
-# NIF for DealsAnalysis.VectorDB.Ruvector
+# Rustler NIF for RuvectorElixir
 
-## To build the NIF module:
+This directory contains the Rust native implemented functions (NIF) for [RuvectorElixir](https://github.com/ruvnet/ruvector).
 
-- Your NIF will now build along with your project.
+## Overview
 
-## To load the NIF:
+The NIF interfaces directly with the `ruvector-core` vector database engine written in Rust. Operations execute on Erlang VM dirty schedulers (`DirtyIo` and `DirtyCpu`) to prevent blocking normal Erlang schedulers during intensive disk I/O and approximate nearest neighbor (ANN) vector calculations.
 
-```elixir
-defmodule DealsAnalysis.VectorDB.Ruvector do
-  use Rustler, otp_app: :deals_analysis, crate: "ruvector_nif"
+## Building
 
-  # When your NIF is loaded, it will override this function.
-  def add(_a, _b), do: :erlang.nif_error(:nif_not_loaded)
-end
-```
+The NIF is compiled automatically by [Rustler](https://github.com/rusterlium/rustler) during `mix compile`. A local Rust toolchain (`cargo` and `rustc` 1.75+) is required.
 
-## Examples
+## Exports
 
-[This](https://github.com/rusterlium/NifIo) is a complete example of a NIF written in Rust.
+- `open_db/2`, `open_db_with_options/3`
+- `insert/2`, `insert_batch/2`
+- `get_entry/2`, `delete/2`
+- `db_len/1`, `is_empty/1`, `all_ids/1`
+- `search/4`, `search_detailed/5`
+- `calculate_distance/3`, `info/1`

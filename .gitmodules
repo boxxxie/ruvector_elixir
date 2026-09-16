@@ -1,0 +1,3 @@
+[submodule "reference/ruvector"]
+	path = reference/ruvector
+	url = https://github.com/ruvnet/ruvector
