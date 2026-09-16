@@ -1,0 +1,44 @@
+[
+  {
+    "id": "company.name",
+    "parentPath": "company",
+    "schemaFile": "company.schema.json",
+    "schemaCleanName": "Company",
+    "description": "The official registered name of the investment target company.",
+    "nodeType": "string",
+    "enums": "",
+    "isRequired": true,
+    "siblings": "id, ticker, address",
+    "semanticDescription": "registered company name",
+    "synonyms": "legal name, entity name, firm name",
+    "promptContext": "Used for identifying the company name."
+  },
+  {
+    "id": "company.ticker",
+    "parentPath": "company",
+    "schemaFile": "company.schema.json",
+    "schemaCleanName": "Company",
+    "description": "The public stock exchange ticker symbol.",
+    "nodeType": "string",
+    "enums": "",
+    "isRequired": false,
+    "siblings": "id, name, address",
+    "semanticDescription": "stock ticker symbol",
+    "synonyms": "symbol, exchange ticker, stock symbol",
+    "promptContext": "Used for locating financial market data."
+  },
+  {
+    "id": "deal.amount",
+    "parentPath": "deal",
+    "schemaFile": "deal.schema.json",
+    "schemaCleanName": "Deal Details",
+    "description": "The total transaction value in USD.",
+    "nodeType": "number",
+    "enums": "",
+    "isRequired": true,
+    "siblings": "date, type, status",
+    "semanticDescription": "total transaction amount in USD",
+    "synonyms": "valuation, deal size, total cost",
+    "promptContext": "Crucial metric for deal size classification."
+  }
+]
