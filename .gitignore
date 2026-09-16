@@ -29,3 +29,19 @@ ruvector_elixir-*.tar
 *.dylib
 *.dll
 
+
+# Editor and IDE
+.elixir_ls/
+.lexical/
+.idea/
+.vscode/
+*.swp
+*~
+.nvim/
+
+# OS specific
+.DS_Store
+Thumbs.db
+
+# Local ruvector databases
+/*.rvf
