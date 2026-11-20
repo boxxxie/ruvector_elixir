@@ -26,8 +26,8 @@ Official Elixir bindings for [**ruvector**](https://github.com/ruvnet/ruvector),
   - `:manhattan` (Manhattan / L1 Distance)
 - **HNSW & Flat Indexing**: Graph-based Hierarchical Navigable Small World (HNSW) indexing for sub-millisecond retrieval on large datasets, plus exact flat indexing.
 - **Rich JSON Metadata Filtering**: Filter vector search results using arbitrary JSON-serializable key-value metadata.
-- **ACID Persistence**: Crash-safe on-disk embedded database files (`.rvf`).
-- **Idiomatic Elixir**: First-class structs (`RuvectorElixir.VectorEntry`), comprehensive typespecs, and functional APIs.
+- **On-Disk & In-Memory Storage**: Crash-safe on-disk embedded database files (`.rvf`) and isolated per-handle in-memory stores (`memory://<name>`), with deterministic `close/1` and scoped `with_open/3,4` lifecycle management.
+- **Idiomatic Elixir**: First-class structs (`RuvectorElixir.VectorEntry`), comprehensive typespecs, bang (`!`) variants raising `RuvectorElixir.Error`, and functional APIs.
 
 ---
 
@@ -38,7 +38,7 @@ Add `ruvector_elixir` to your list of dependencies in `mix.exs`:
 ```elixir
 def deps do
   [
-    {:ruvector_elixir, "~> 0.1.0"}
+    {:ruvector_elixir, "~> 0.2.0"}
   ]
 end
 ```
@@ -57,22 +57,34 @@ curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 
 ### 1. Opening a Database
 
-Create or open a database with a specified vector dimension (e.g. 128 dimensions):
+Create or open an on-disk `.rvf` or isolated `memory://` database with a specified vector dimension (e.g. 128 dimensions):
 
 ```elixir
-# Default Cosine metric with exact flat indexing
-{:ok, db} = RuvectorElixir.open("priv/data/embeddings.rvf", 128)
+# Isolated in-memory database (does not touch disk)
+{:ok, mem_db} = RuvectorElixir.open("memory://quickstart", 128)
+:ok = RuvectorElixir.close(mem_db)
 
-# With HNSW index and Euclidean distance
+# On-disk Cosine metric with exact flat indexing
+{:ok, flat_db} = RuvectorElixir.open("priv/data/flat_embeddings.rvf", 128)
+:ok = RuvectorElixir.close(flat_db)
+
+# On-disk HNSW index with Euclidean distance
 {:ok, db} = RuvectorElixir.open("priv/data/embeddings.rvf", 128, %{
   metric: :euclidean,
   hnsw: %{
     m: 16,
     ef_construction: 100,
-    ef_search: 50,
-    max_elements: 100_000
+    ef_search: 100,
+    max_elements: 1_000_000
   }
 })
+
+# Or scope the handle automatically with with_open/3,4 (closes on exit or exception)
+{:ok, count} =
+  RuvectorElixir.with_open("memory://scoped", 128, [metric: :cosine], fn scoped_db ->
+    {:ok, _id} = RuvectorElixir.insert(scoped_db, List.duplicate(0.1, 128))
+    RuvectorElixir.len!(scoped_db)
+  end)
 ```
 
 ### 2. Inserting Vectors
@@ -112,8 +124,9 @@ query = [0.1, 0.2, 0.3, ...]
 {:ok, ids} = RuvectorElixir.search(db, query, 5)
 # => {:ok, ["doc_1", "doc_3", "doc_2"]}
 
-# Search with metadata filtering
-{:ok, filtered_ids} = RuvectorElixir.search(db, query, 5, filter: %{"category" => "programming"})
+# Search with metadata filtering and per-query :ef_search override
+{:ok, filtered_ids} =
+  RuvectorElixir.search(db, query, 5, filter: %{"category" => "programming"}, ef_search: 100)
 # => {:ok, ["doc_1", "doc_3"]}
 
 # Detailed search (returns ID, distance score, vector, and metadata)
@@ -170,17 +183,18 @@ v2 = [0.0, 1.0, 0.0]
 
 | Option | Type | Default | Description |
 | :--- | :--- | :--- | :--- |
-| `:metric` | atom / string | `:cosine` | Distance metric (`:cosine`, `:euclidean`, `:dot_product`, `:manhattan`). |
-| `:hnsw` | boolean / map | `nil` | `true` for default HNSW, or map with tuning parameters (see below). |
+| `:metric` / `:distance_metric` | atom / string | `:cosine` | Distance metric (`:cosine`, `:euclidean`, `:dot_product`, `:manhattan`). |
+| `:hnsw` | boolean / map / keyword | `nil` | `true` for default HNSW, `false` for flat index, or map/keyword with tuning parameters (see below). |
+| `:quantization` | atom / string / map / keyword | `nil` | `:none`, `:scalar`, `:binary`, or `%{type: :product, subspaces: pos_integer(), k: pos_integer()}` where `subspaces` divides `dimensions`. Persisted/reported in `info/1`; `ruvector-core` 2.3.0 stores vectors in `f32` precision. |
 
 ### HNSW Configuration
 
-| Parameter | Type | Default | Description |
-| :--- | :--- | :--- | :--- |
-| `:m` | pos_integer | `16` | Maximum number of outgoing edges per node in the graph. |
-| `:ef_construction` | pos_integer | `100` | Size of the candidate list evaluated during index construction. |
-| `:ef_search` | pos_integer | `50` | Default candidate list size during search. |
-| `:max_elements` | pos_integer | `100_000` | Initial pre-allocated capacity for vectors. |
+| Parameter | Type | Default | Bounds | Description |
+| :--- | :--- | :--- | :--- | :--- |
+| `:m` | pos_integer | `16` | `2..256` | Maximum number of bi-directional edges per node in the graph. |
+| `:ef_construction` | pos_integer | `100` | `1..1_000_000` | Size of the dynamic candidate list evaluated during index construction. |
+| `:ef_search` | pos_integer | `100` | `1..1_000_000` | Default candidate list size during search (can be overridden per query via `search/4`). |
+| `:max_elements` | pos_integer | `1_000_000` | `1..10_000_000` | Initial pre-allocated capacity for vectors in the graph index. |
 
 ---
 
@@ -199,9 +213,10 @@ v2 = [0.0, 1.0, 0.0]
                +---------------+---------------+
                |                               |
        [DirtyIo Threads]               [DirtyCpu Threads]
-     - open_db / persistence         - k-NN search
+     - open_db_with_options          - k-NN search / HNSW
+     - close_db / info               - large vector distance
      - insert / insert_batch         - distance calculations
-     - get / delete / all_ids        - HNSW graph traversal
+     - get_entry / delete / all_ids
                |                               |
                +---------------+---------------+
                                |
@@ -213,7 +228,7 @@ v2 = [0.0, 1.0, 0.0]
 
 - **Thread Safety**: The Rust database engine features concurrent storage and internal index locking, managed directly inside a Rustler `ResourceArc`. Multiple Elixir processes (e.g. concurrent Tasks or GenServers) can concurrently read, insert, and search the database with zero locking overhead.
 - **Zero BEAM Blocking**: All CPU-intensive searches run on Erlang `DirtyCpu` schedulers, while all disk I/O operations run on `DirtyIo` schedulers, keeping the normal BEAM schedulers free for Web / LiveView requests.
-- **Idiomatic APIs & Bang Variants**: Supports both tuple results `{:ok, res} | {:error, reason}` and bang variants (`open!`, `insert!`, `search!`, `get!`, `delete!`, `len!`) that raise on failure. Options can be supplied as maps or keyword lists.
+- **Idiomatic APIs & Bang Variants**: Supports both tuple results `{:ok, res} | {:error, reason}` and bang variants (`open!`, `with_open!`, `insert!`, `search!`, `get!`, `delete!`, `len!`, etc.) that raise `RuvectorElixir.Error` on operational failures and `ArgumentError` on invalid caller inputs. Options can be supplied as maps or keyword lists.
 
 ---
 
@@ -234,17 +249,18 @@ This repository tracks the official upstream [ruvector](https://github.com/ruvne
 ### Cloning with Submodule
 
 ```bash
-git clone --recurse-submodules https://github.com/ruvnet/ruvector.git
+git clone --recurse-submodules https://github.com/boxxxie/ruvector_elixir.git
 # Or if already cloned:
 git submodule update --init --recursive
 ```
 
-### Running Tests
+### Running Tests & Precommit Checks
 
-Execute the complete test suite:
+Execute the complete test suite or run the full formatting, Cargo clippy/fmt, strict compile, and test suite check:
 
 ```bash
 mix test
+mix precommit
 ```
 
 Generate ExDoc documentation:
@@ -258,7 +274,7 @@ mix docs
 ## Upstream Project
 
 - **Core Repository**: [https://github.com/ruvnet/ruvector](https://github.com/ruvnet/ruvector)
-- **Crates**: `ruvector-core`, `ruvector-graph`
+- **Crate**: `ruvector-core`
 
 ---
 

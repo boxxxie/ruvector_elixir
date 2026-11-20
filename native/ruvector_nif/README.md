@@ -1,6 +1,6 @@
 # Rustler NIF for RuvectorElixir
 
-This directory contains the Rust native implemented functions (NIF) for [RuvectorElixir](https://github.com/ruvnet/ruvector).
+This directory contains the Rust native implemented functions (NIF) for [RuvectorElixir](https://github.com/boxxxie/ruvector_elixir).
 
 ## Overview
 
@@ -12,9 +12,9 @@ The NIF is compiled automatically by [Rustler](https://github.com/rusterlium/rus
 
 ## Exports
 
-- `open_db/2`, `open_db_with_options/3`
+- `open_db_with_options/3`, `close_db/1`, `info/1`
 - `insert/2`, `insert_batch/2`
 - `get_entry/2`, `delete/2`
 - `db_len/1`, `is_empty/1`, `all_ids/1`
-- `search/4`, `search_detailed/5`
-- `calculate_distance/3`, `info/1`
+- `search/5`, `search_detailed/5`
+- `calculate_distance/3`, `calculate_distance_dirty/3`

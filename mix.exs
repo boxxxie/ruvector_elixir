@@ -1,8 +1,8 @@
 defmodule RuvectorElixir.MixProject do
   use Mix.Project
 
-  @version "0.1.0"
-  @source_url "https://github.com/ruvnet/ruvector"
+  @version "0.2.0"
+  @source_url "https://github.com/boxxxie/ruvector_elixir"
 
   def project do
     [
@@ -42,7 +42,8 @@ defmodule RuvectorElixir.MixProject do
       licenses: ["MIT"],
       links: %{
         "GitHub" => @source_url,
-        "ruvector" => @source_url
+        "Changelog" => "#{@source_url}/blob/v#{@version}/CHANGELOG.md",
+        "Upstream ruvector" => "https://github.com/ruvnet/ruvector"
       },
       files: [
         "lib",
@@ -54,6 +55,7 @@ defmodule RuvectorElixir.MixProject do
         "mix.exs",
         ".formatter.exs",
         "README.md",
+        "CHANGELOG.md",
         "LICENSE"
       ]
     ]
@@ -76,7 +78,7 @@ defmodule RuvectorElixir.MixProject do
       main: "RuvectorElixir",
       source_ref: "v#{@version}",
       source_url: @source_url,
-      extras: ["README.md", "LICENSE"]
+      extras: ["README.md", "CHANGELOG.md", "LICENSE"]
     ]
   end
 
