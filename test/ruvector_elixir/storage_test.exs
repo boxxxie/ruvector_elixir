@@ -1,16 +1,12 @@
 defmodule RuvectorElixir.StorageTest do
   use ExUnit.Case, async: true
 
-  alias RuvectorElixir.VectorEntry
+  alias RuvectorElixir.{Error, VectorEntry}
 
-  setup do
-    db_path =
-      Path.join(System.tmp_dir!(), "ruvector_storage_#{System.unique_integer([:positive])}.rvf")
+  @moduletag :tmp_dir
 
-    on_exit(fn ->
-      File.rm_rf(db_path)
-    end)
-
+  setup %{tmp_dir: tmp_dir} do
+    db_path = Path.join(tmp_dir, "ruvector_storage.rvf")
     {:ok, db} = RuvectorElixir.open(db_path, 3)
     {:ok, db: db, db_path: db_path}
   end
@@ -33,19 +29,17 @@ defmodule RuvectorElixir.StorageTest do
       entry = VectorEntry.new([1.0, 2.0, 3.0], id: "struct_entry", metadata: %{"tag" => "v1"})
 
       assert {:ok, "struct_entry"} = RuvectorElixir.insert(db, entry)
-      assert {:ok, retrieved} = RuvectorElixir.get_entry(db, "struct_entry")
+      assert {:ok, retrieved} = RuvectorElixir.get(db, "struct_entry")
       assert retrieved.id == "struct_entry"
       assert retrieved.vector == [1.0, 2.0, 3.0]
       assert retrieved.metadata == %{"tag" => "v1"}
     end
 
     test "insert auto generates id when omitted or nil", %{db: db} do
-      # Test map with nil id
       assert {:ok, id1} = RuvectorElixir.insert(db, %{vector: [1.0, 2.0, 3.0]})
       assert is_binary(id1)
       assert String.contains?(id1, "-")
 
-      # Test raw vector list
       assert {:ok, id2} = RuvectorElixir.insert(db, [4.0, 5.0, 6.0])
       assert is_binary(id2)
       assert String.contains?(id2, "-")
@@ -90,7 +84,7 @@ defmodule RuvectorElixir.StorageTest do
     end
 
     test "delete existing entry", %{db: db} do
-      {:ok, "del_me"} = RuvectorElixir.insert(db, %{id: "del_me", vector: [1.0, 2.0, 3.0]})
+      assert {:ok, "del_me"} = RuvectorElixir.insert(db, %{id: "del_me", vector: [1.0, 2.0, 3.0]})
       assert {:ok, 1} = RuvectorElixir.count(db)
 
       assert {:ok, true} = RuvectorElixir.delete(db, "del_me")
@@ -121,7 +115,7 @@ defmodule RuvectorElixir.StorageTest do
       assert entry2.vector == [4.0, 5.0, 6.0]
     end
 
-    test "batch insert dimension mismatch error", %{db: db} do
+    test "batch insert dimension mismatch error rolls back atomically", %{db: db} do
       entries = [
         %{id: "b1", vector: [1.0, 2.0, 3.0]},
         %{id: "b2", vector: [4.0, 5.0]}
@@ -129,24 +123,26 @@ defmodule RuvectorElixir.StorageTest do
 
       assert {:error, reason} = RuvectorElixir.insert_batch(db, entries)
       assert String.contains?(reason, "mismatch") or String.contains?(reason, "Dimension")
+      assert {:ok, 0} = RuvectorElixir.len(db)
+      assert {:error, :not_found} = RuvectorElixir.get(db, "b1")
     end
 
-    test "all_ids and empty? lifecycle", %{db: db} do
-      assert {:ok, true} = RuvectorElixir.empty?(db)
+    test "keys and empty? lifecycle", %{db: db} do
+      assert RuvectorElixir.empty?(db) == true
       assert {:ok, []} = RuvectorElixir.keys(db)
 
-      RuvectorElixir.insert(db, %{id: "k1", vector: [1.0, 2.0, 3.0]})
-      RuvectorElixir.insert(db, %{id: "k2", vector: [4.0, 5.0, 6.0]})
+      assert {:ok, "k1"} = RuvectorElixir.insert(db, %{id: "k1", vector: [1.0, 2.0, 3.0]})
+      assert {:ok, "k2"} = RuvectorElixir.insert(db, %{id: "k2", vector: [4.0, 5.0, 6.0]})
 
-      assert {:ok, false} = RuvectorElixir.empty?(db)
+      assert RuvectorElixir.empty?(db) == false
       assert {:ok, keys} = RuvectorElixir.keys(db)
       assert Enum.sort(keys) == ["k1", "k2"]
 
-      RuvectorElixir.delete(db, "k1")
+      assert {:ok, true} = RuvectorElixir.delete(db, "k1")
       assert {:ok, ["k2"]} = RuvectorElixir.keys(db)
 
-      RuvectorElixir.delete(db, "k2")
-      assert {:ok, true} = RuvectorElixir.empty?(db)
+      assert {:ok, true} = RuvectorElixir.delete(db, "k2")
+      assert RuvectorElixir.empty?(db) == true
       assert {:ok, []} = RuvectorElixir.keys(db)
     end
 
@@ -165,7 +161,9 @@ defmodule RuvectorElixir.StorageTest do
       assert {:error, :not_found} = RuvectorElixir.get(db, :atom_key)
     end
 
-    test "insert with integer ID and retrieve/delete with integer ID", %{db: db} do
+    test "insert with integer ID (including > i64::MAX) and retrieve/delete with integer ID", %{
+      db: db
+    } do
       assert {:ok, "42"} = RuvectorElixir.insert(db, %{id: 42, vector: [1.0, 2.0, 3.0]})
 
       assert {:ok, entry} = RuvectorElixir.get(db, 42)
@@ -173,11 +171,18 @@ defmodule RuvectorElixir.StorageTest do
 
       assert {:ok, true} = RuvectorElixir.delete(db, 42)
       assert {:error, :not_found} = RuvectorElixir.get(db, 42)
+
+      big_id = 18_446_744_073_709_551_616
+      entry_struct = VectorEntry.new([1.0, 2.0, 3.0], id: big_id)
+      assert {:ok, "18446744073709551616"} = RuvectorElixir.insert(db, entry_struct)
+      assert {:ok, fetched} = RuvectorElixir.get(db, big_id)
+      assert fetched.id == "18446744073709551616"
+      assert {:ok, true} = RuvectorElixir.delete(db, big_id)
     end
 
     test "get_struct and get_struct! return VectorEntry struct", %{db: db} do
       entry = VectorEntry.new([1.0, 2.0, 3.0], id: "struct_test", metadata: %{"k" => "v"})
-      {:ok, "struct_test"} = RuvectorElixir.insert(db, entry)
+      assert {:ok, "struct_test"} = RuvectorElixir.insert(db, entry)
 
       assert {:ok, %VectorEntry{} = struct} = RuvectorElixir.get_struct(db, "struct_test")
       assert struct.id == "struct_test"
@@ -187,12 +192,12 @@ defmodule RuvectorElixir.StorageTest do
       assert %VectorEntry{} = struct2 = RuvectorElixir.get_struct!(db, "struct_test")
       assert struct2.id == "struct_test"
 
-      assert_raise RuntimeError, ~r/not found/, fn ->
+      assert_raise Error, ~r/not found/i, fn ->
         RuvectorElixir.get_struct!(db, "nonexistent")
       end
     end
 
-    test "bang variants (insert!, insert_batch!, get!, delete!, len!, keys!)", %{db: db} do
+    test "bang variants (insert!, insert_batch!, get!, delete!, len!, keys!, info!)", %{db: db} do
       id1 = RuvectorElixir.insert!(db, %{id: "bang1", vector: [1.0, 2.0, 3.0]})
       assert id1 == "bang1"
 
@@ -215,7 +220,9 @@ defmodule RuvectorElixir.StorageTest do
       keys = RuvectorElixir.keys!(db)
       assert Enum.sort(keys) == ["bang2", "bang3"]
 
-      assert_raise ArgumentError, fn ->
+      assert %{node_count: 2, dimensions: 3} = RuvectorElixir.info!(db)
+
+      assert_raise Error, fn ->
         RuvectorElixir.insert!(db, %{vector: [1.0, 2.0]})
       end
     end

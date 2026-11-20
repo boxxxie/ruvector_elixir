@@ -8,13 +8,20 @@ defmodule RuvectorElixir.MixProject do
     [
       app: :ruvector_elixir,
       version: @version,
-      elixir: "~> 1.14",
+      elixir: "~> 1.18",
       start_permanent: Mix.env() == :prod,
       description: description(),
       package: package(),
       docs: docs(),
       deps: deps(),
+      aliases: aliases(),
       source_url: @source_url
+    ]
+  end
+
+  def cli do
+    [
+      preferred_envs: [precommit: :test]
     ]
   end
 
@@ -44,8 +51,19 @@ defmodule RuvectorElixir.MixProject do
         "native/ruvector_nif/Cargo.lock",
         "native/ruvector_nif/README.md",
         "mix.exs",
+        ".formatter.exs",
         "README.md",
         "LICENSE"
+      ]
+    ]
+  end
+
+  defp aliases do
+    [
+      precommit: [
+        "format --check-formatted",
+        "compile --warnings-as-errors",
+        "test"
       ]
     ]
   end
@@ -62,7 +80,7 @@ defmodule RuvectorElixir.MixProject do
   # Run "mix help deps" to learn about dependencies.
   defp deps do
     [
-      {:rustler, "~> 0.36.0"},
+      {:rustler, "~> 0.38.0", runtime: false},
       {:ex_doc, ">= 0.0.0", only: :dev, runtime: false}
     ]
   end

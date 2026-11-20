@@ -1,37 +1,532 @@
 use rustler::{Encoder, Env, NifResult, ResourceArc, Term};
+use ruvector_core::index::flat::FlatIndex;
+use ruvector_core::index::hnsw::HnswIndex;
+use ruvector_core::index::VectorIndex;
 use ruvector_core::types::{
-    DbOptions, DistanceMetric, HnswConfig, QuantizationConfig, SearchQuery, VectorEntry,
+    DbOptions, DistanceMetric, HnswConfig, QuantizationConfig, SearchQuery, SearchResult,
+    VectorEntry,
 };
 use ruvector_core::VectorDB;
 use std::collections::HashMap;
+use std::sync::RwLock;
 
-// Wrap the VectorDB in a struct so we can implement the Resource trait
-pub struct DbResource {
-    pub db: VectorDB,
+const MAX_JSON_DEPTH: usize = 128;
+
+enum DbBackend {
+    Persistent(VectorDB),
+    InMemory(InMemoryDB),
 }
+
+struct InMemoryDB {
+    entries: RwLock<HashMap<String, VectorEntry>>,
+    index: RwLock<Box<dyn VectorIndex>>,
+    options: DbOptions,
+}
+
+impl InMemoryDB {
+    fn new(options: DbOptions) -> Result<Self, String> {
+        let index: Box<dyn VectorIndex> = match &options.hnsw_config {
+            Some(cfg) => Box::new(
+                HnswIndex::new(options.dimensions, options.distance_metric, cfg.clone())
+                    .map_err(|e| e.to_string())?,
+            ),
+            None => Box::new(FlatIndex::new(options.dimensions, options.distance_metric)),
+        };
+
+        Ok(Self {
+            entries: RwLock::new(HashMap::new()),
+            index: RwLock::new(index),
+            options,
+        })
+    }
+
+    fn insert(&self, mut entry: VectorEntry) -> Result<String, String> {
+        if entry.vector.len() != self.options.dimensions {
+            return Err(format!(
+                "Dimension mismatch: expected {}, actual {}",
+                self.options.dimensions,
+                entry.vector.len()
+            ));
+        }
+
+        let id = entry
+            .id
+            .take()
+            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+        entry.id = Some(id.clone());
+
+        let vec_for_index = entry.vector.clone();
+
+        {
+            let mut entries = self
+                .entries
+                .write()
+                .map_err(|_| "In-memory entries lock poisoned".to_string())?;
+            entries.insert(id.clone(), entry);
+        }
+
+        let mut index = self
+            .index
+            .write()
+            .map_err(|_| "In-memory index lock poisoned".to_string())?;
+        index
+            .add(id.clone(), vec_for_index)
+            .map_err(|e| e.to_string())?;
+
+        Ok(id)
+    }
+
+    fn insert_batch(&self, entries_in: Vec<VectorEntry>) -> Result<Vec<String>, String> {
+        for entry in &entries_in {
+            if entry.vector.len() != self.options.dimensions {
+                return Err(format!(
+                    "Dimension mismatch: expected {}, actual {}",
+                    self.options.dimensions,
+                    entry.vector.len()
+                ));
+            }
+        }
+
+        let mut ids = Vec::with_capacity(entries_in.len());
+        let mut index_entries = Vec::with_capacity(entries_in.len());
+
+        {
+            let mut entries = self
+                .entries
+                .write()
+                .map_err(|_| "In-memory entries lock poisoned".to_string())?;
+
+            for mut entry in entries_in {
+                let id = entry
+                    .id
+                    .take()
+                    .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+                entry.id = Some(id.clone());
+                index_entries.push((id.clone(), entry.vector.clone()));
+                entries.insert(id.clone(), entry);
+                ids.push(id);
+            }
+        }
+
+        let mut index = self
+            .index
+            .write()
+            .map_err(|_| "In-memory index lock poisoned".to_string())?;
+        index.add_batch(index_entries).map_err(|e| e.to_string())?;
+
+        Ok(ids)
+    }
+
+    fn get(&self, id: &str) -> Result<Option<VectorEntry>, String> {
+        let entries = self
+            .entries
+            .read()
+            .map_err(|_| "In-memory entries lock poisoned".to_string())?;
+        Ok(entries.get(id).cloned())
+    }
+
+    fn delete(&self, id: &str) -> Result<bool, String> {
+        let removed = {
+            let mut entries = self
+                .entries
+                .write()
+                .map_err(|_| "In-memory entries lock poisoned".to_string())?;
+            entries.remove(id).is_some()
+        };
+
+        if removed {
+            let mut index = self
+                .index
+                .write()
+                .map_err(|_| "In-memory index lock poisoned".to_string())?;
+            let _ = index.remove(&id.to_string()).map_err(|e| e.to_string())?;
+        }
+
+        Ok(removed)
+    }
+
+    fn len(&self) -> Result<usize, String> {
+        let entries = self
+            .entries
+            .read()
+            .map_err(|_| "In-memory entries lock poisoned".to_string())?;
+        Ok(entries.len())
+    }
+
+    fn is_empty(&self) -> Result<bool, String> {
+        let entries = self
+            .entries
+            .read()
+            .map_err(|_| "In-memory entries lock poisoned".to_string())?;
+        Ok(entries.is_empty())
+    }
+
+    fn keys(&self) -> Result<Vec<String>, String> {
+        let entries = self
+            .entries
+            .read()
+            .map_err(|_| "In-memory entries lock poisoned".to_string())?;
+        Ok(entries.keys().cloned().collect())
+    }
+
+    fn search_unfiltered(&self, query_vec: &[f32], k: usize) -> Result<Vec<SearchResult>, String> {
+        if query_vec.len() != self.options.dimensions {
+            return Err(format!(
+                "Dimension mismatch: expected {}, actual {}",
+                self.options.dimensions,
+                query_vec.len()
+            ));
+        }
+
+        if k == 0 {
+            return Ok(Vec::new());
+        }
+
+        let mut results = {
+            let index = self
+                .index
+                .read()
+                .map_err(|_| "In-memory index lock poisoned".to_string())?;
+            index.search(query_vec, k).map_err(|e| e.to_string())?
+        };
+
+        let entries = self
+            .entries
+            .read()
+            .map_err(|_| "In-memory entries lock poisoned".to_string())?;
+        for result in &mut results {
+            if let Some(entry) = entries.get(&result.id) {
+                result.vector = Some(entry.vector.clone());
+                result.metadata = entry.metadata.clone();
+            }
+        }
+
+        Ok(results)
+    }
+
+    fn options(&self) -> &DbOptions {
+        &self.options
+    }
+}
+
+impl DbBackend {
+    fn insert(&self, entry: VectorEntry) -> Result<String, String> {
+        match self {
+            DbBackend::Persistent(db) => db.insert(entry).map_err(|e| e.to_string()),
+            DbBackend::InMemory(db) => db.insert(entry),
+        }
+    }
+
+    fn insert_batch(&self, entries: Vec<VectorEntry>) -> Result<Vec<String>, String> {
+        match self {
+            DbBackend::Persistent(db) => db.insert_batch(entries).map_err(|e| e.to_string()),
+            DbBackend::InMemory(db) => db.insert_batch(entries),
+        }
+    }
+
+    fn get(&self, id: &str) -> Result<Option<VectorEntry>, String> {
+        match self {
+            DbBackend::Persistent(db) => db.get(id).map_err(|e| e.to_string()),
+            DbBackend::InMemory(db) => db.get(id),
+        }
+    }
+
+    fn delete(&self, id: &str) -> Result<bool, String> {
+        match self {
+            DbBackend::Persistent(db) => db.delete(id).map_err(|e| e.to_string()),
+            DbBackend::InMemory(db) => db.delete(id),
+        }
+    }
+
+    fn len(&self) -> Result<usize, String> {
+        match self {
+            DbBackend::Persistent(db) => db.len().map_err(|e| e.to_string()),
+            DbBackend::InMemory(db) => db.len(),
+        }
+    }
+
+    fn is_empty(&self) -> Result<bool, String> {
+        match self {
+            DbBackend::Persistent(db) => db.is_empty().map_err(|e| e.to_string()),
+            DbBackend::InMemory(db) => db.is_empty(),
+        }
+    }
+
+    fn keys(&self) -> Result<Vec<String>, String> {
+        match self {
+            DbBackend::Persistent(db) => db.keys().map_err(|e| e.to_string()),
+            DbBackend::InMemory(db) => db.keys(),
+        }
+    }
+
+    fn search_unfiltered(
+        &self,
+        vector: &[f32],
+        k: usize,
+        ef_search: Option<usize>,
+    ) -> Result<Vec<SearchResult>, String> {
+        let expected_dim = self.options().dimensions;
+        if vector.len() != expected_dim {
+            return Err(format!(
+                "Dimension mismatch: expected {}, actual {}",
+                expected_dim,
+                vector.len()
+            ));
+        }
+
+        if k == 0 {
+            return Ok(Vec::new());
+        }
+
+        match self {
+            DbBackend::Persistent(db) => db
+                .search(SearchQuery {
+                    vector: vector.to_vec(),
+                    k,
+                    filter: None,
+                    ef_search,
+                })
+                .map_err(|e| e.to_string()),
+            DbBackend::InMemory(db) => db.search_unfiltered(vector, k),
+        }
+    }
+
+    fn search(&self, query: SearchQuery) -> Result<Vec<SearchResult>, String> {
+        let expected_dim = self.options().dimensions;
+        if query.vector.len() != expected_dim {
+            return Err(format!(
+                "Dimension mismatch: expected {}, actual {}",
+                expected_dim,
+                query.vector.len()
+            ));
+        }
+
+        if query.k == 0 {
+            return Ok(Vec::new());
+        }
+
+        let Some(filter) = &query.filter else {
+            let results = self.search_unfiltered(&query.vector, query.k, query.ef_search)?;
+            if results.len() < query.k && self.options().hnsw_config.is_some() {
+                let total = self.len()?;
+                if total > results.len() {
+                    let mut fetch_k = query.k.saturating_mul(4).max(64).min(total);
+                    loop {
+                        let mut widened =
+                            self.search_unfiltered(&query.vector, fetch_k, query.ef_search)?;
+                        if widened.len() >= query.k || fetch_k >= total {
+                            widened.truncate(query.k);
+                            return Ok(widened);
+                        }
+                        fetch_k = fetch_k.saturating_mul(2).min(total);
+                    }
+                }
+            }
+            return Ok(results);
+        };
+
+        let total = self.len()?;
+        if total == 0 {
+            return Ok(Vec::new());
+        }
+
+        // Iteratively over-fetch unfiltered candidates so post-filtering preserves
+        // top-k recall without forcing a full scan when matches are common, while
+        // still reaching full recall up to `total` when matches are sparse.
+        let mut fetch_k = query.k.saturating_mul(4).max(64).min(total);
+        loop {
+            let candidates = self.search_unfiltered(&query.vector, fetch_k, query.ef_search)?;
+            let mut matched: Vec<SearchResult> = candidates
+                .into_iter()
+                .filter(|r| matches_filter(r.metadata.as_ref(), filter))
+                .collect();
+
+            if matched.len() >= query.k || fetch_k >= total {
+                matched.truncate(query.k);
+                return Ok(matched);
+            }
+
+            fetch_k = fetch_k.saturating_mul(2).min(total);
+        }
+    }
+
+    fn options(&self) -> &DbOptions {
+        match self {
+            DbBackend::Persistent(db) => db.options(),
+            DbBackend::InMemory(db) => db.options(),
+        }
+    }
+}
+
+fn json_values_equal(a: &serde_json::Value, b: &serde_json::Value) -> bool {
+    match (a, b) {
+        (serde_json::Value::Number(na), serde_json::Value::Number(nb)) => {
+            if na == nb {
+                true
+            } else {
+                match (na.as_f64(), nb.as_f64()) {
+                    (Some(fa), Some(fb)) => fa == fb,
+                    _ => false,
+                }
+            }
+        }
+        (serde_json::Value::Array(aa), serde_json::Value::Array(ab)) => {
+            aa.len() == ab.len()
+                && aa
+                    .iter()
+                    .zip(ab.iter())
+                    .all(|(xa, xb)| json_values_equal(xa, xb))
+        }
+        (serde_json::Value::Object(oa), serde_json::Value::Object(ob)) => {
+            oa.len() == ob.len()
+                && oa
+                    .iter()
+                    .all(|(k_str, va)| ob.get(k_str).is_some_and(|vb| json_values_equal(va, vb)))
+        }
+        _ => a == b,
+    }
+}
+
+fn matches_filter(
+    meta: Option<&HashMap<String, serde_json::Value>>,
+    filter: &HashMap<String, serde_json::Value>,
+) -> bool {
+    let Some(meta) = meta else {
+        return false;
+    };
+    filter.iter().all(|(k_str, v_val)| {
+        meta.get(k_str)
+            .is_some_and(|mv| json_values_equal(mv, v_val))
+    })
+}
+
+pub struct DbResource {
+    db: RwLock<Option<DbBackend>>,
+}
+
+#[rustler::resource_impl]
+impl rustler::Resource for DbResource {}
 
 rustler::atoms! {
     ok,
     error,
     not_found,
+    closed,
     cosine,
     euclidean,
     dot_product,
     manhattan,
+    none,
+    scalar,
+    binary,
+    product,
+    type_ = "type",
+    subspaces,
+    k,
     id,
     vector,
     metadata,
     score,
+    node_count,
+    dimensions,
+    distance_metric,
+    storage_path,
+    hnsw,
+    quantization,
+    m,
+    ef_construction,
+    ef_search,
+    max_elements,
 }
 
-#[allow(non_local_definitions)]
-fn load(env: Env, _info: Term) -> bool {
-    let _ = rustler::resource!(DbResource, env);
-    true
+enum DbAccessError {
+    Closed,
+    Message(String),
 }
 
-// Convert an Elixir Term into a serde_json::Value
+impl DbAccessError {
+    fn encode<'a>(&self, env: Env<'a>) -> Term<'a> {
+        match self {
+            DbAccessError::Closed => (error(), closed()).encode(env),
+            DbAccessError::Message(msg) => (error(), msg.as_str()).encode(env),
+        }
+    }
+}
+
+fn with_db<F, R>(resource: &ResourceArc<DbResource>, f: F) -> Result<R, DbAccessError>
+where
+    F: FnOnce(&DbBackend) -> Result<R, String>,
+{
+    let guard = resource
+        .db
+        .read()
+        .map_err(|_| DbAccessError::Message("Database lock poisoned".to_string()))?;
+    match guard.as_ref() {
+        Some(backend) => f(backend).map_err(DbAccessError::Message),
+        None => Err(DbAccessError::Closed),
+    }
+}
+
+fn is_nil_or_bool(term: Term) -> bool {
+    rustler::types::atom::nil() == term || term.decode::<bool>().is_ok()
+}
+
+fn decode_map_key(term: Term) -> Result<String, rustler::Error> {
+    if let Ok(s) = term.decode::<String>() {
+        Ok(s)
+    } else if is_nil_or_bool(term) {
+        Err(rustler::Error::BadArg)
+    } else if let Ok(name) = term.atom_to_string() {
+        if name == "__struct__" {
+            Err(rustler::Error::BadArg)
+        } else {
+            Ok(name)
+        }
+    } else if let Ok(i) = term.decode::<i64>() {
+        Ok(i.to_string())
+    } else if let Ok(u) = term.decode::<u64>() {
+        Ok(u.to_string())
+    } else {
+        Err(rustler::Error::BadArg)
+    }
+}
+
+fn map_term_to_json_map(
+    term: Term,
+    depth: usize,
+) -> Result<HashMap<String, serde_json::Value>, rustler::Error> {
+    if depth > MAX_JSON_DEPTH {
+        return Err(rustler::Error::BadArg);
+    }
+
+    let map_iter = rustler::types::map::MapIterator::new(term).ok_or(rustler::Error::BadArg)?;
+    let mut map = HashMap::new();
+
+    for (k_term, v_term) in map_iter {
+        if rustler::types::atom::__struct__() == k_term {
+            return Err(rustler::Error::BadArg);
+        }
+        let key = decode_map_key(k_term)?;
+        let val = term_to_json_depth(v_term, depth + 1)?;
+        if map.insert(key, val).is_some() {
+            return Err(rustler::Error::BadArg);
+        }
+    }
+
+    Ok(map)
+}
+
 fn term_to_json(term: Term) -> Result<serde_json::Value, rustler::Error> {
+    term_to_json_depth(term, 0)
+}
+
+// Strictly convert a supported Elixir term into a serde_json::Value with a
+// recursion depth cap to prevent OS scheduler-thread stack overflow.
+fn term_to_json_depth(term: Term, depth: usize) -> Result<serde_json::Value, rustler::Error> {
+    if depth > MAX_JSON_DEPTH {
+        return Err(rustler::Error::BadArg);
+    }
+
     if rustler::types::atom::nil() == term {
         return Ok(serde_json::Value::Null);
     }
@@ -45,9 +540,12 @@ fn term_to_json(term: Term) -> Result<serde_json::Value, rustler::Error> {
         return Ok(serde_json::Value::Number(u.into()));
     }
     if let Ok(f) = term.decode::<f64>() {
-        if let Some(n) = serde_json::Number::from_f64(f) {
-            return Ok(serde_json::Value::Number(n));
+        if f.is_finite() {
+            if let Some(n) = serde_json::Number::from_f64(f) {
+                return Ok(serde_json::Value::Number(n));
+            }
         }
+        return Err(rustler::Error::BadArg);
     }
     if let Ok(s) = term.decode::<String>() {
         return Ok(serde_json::Value::String(s));
@@ -55,82 +553,133 @@ fn term_to_json(term: Term) -> Result<serde_json::Value, rustler::Error> {
     if let Ok(name) = term.atom_to_string() {
         return Ok(serde_json::Value::String(name));
     }
-    if let Ok(list) = term.decode::<Vec<Term>>() {
+    if term.is_list() {
+        let list = term.decode::<Vec<Term>>()?;
         let mut values = Vec::with_capacity(list.len());
         for item in list {
-            values.push(term_to_json(item)?);
+            values.push(term_to_json_depth(item, depth + 1)?);
         }
         return Ok(serde_json::Value::Array(values));
     }
     if let Some(map_iter) = rustler::types::map::MapIterator::new(term) {
         let mut map = serde_json::Map::new();
         for (k_term, v_term) in map_iter {
-            let key: String = if let Ok(s) = k_term.decode::<String>() {
-                s
-            } else if let Ok(name) = k_term.atom_to_string() {
-                if name == "__struct__" {
-                    continue;
-                }
-                name
-            } else if let Ok(i) = k_term.decode::<i64>() {
-                i.to_string()
-            } else {
-                continue;
-            };
-            map.insert(key, term_to_json(v_term)?);
+            if rustler::types::atom::__struct__() == k_term {
+                return Err(rustler::Error::BadArg);
+            }
+            let key = decode_map_key(k_term)?;
+            let val = term_to_json_depth(v_term, depth + 1)?;
+            if map.insert(key, val).is_some() {
+                return Err(rustler::Error::BadArg);
+            }
         }
         return Ok(serde_json::Value::Object(map));
     }
-    Ok(serde_json::Value::Null)
+
+    Err(rustler::Error::BadArg)
 }
 
-// Convert a serde_json::Value back into an Elixir Term
-fn json_to_term<'a>(env: Env<'a>, val: &serde_json::Value) -> Term<'a> {
+fn json_to_term<'a>(env: Env<'a>, val: &serde_json::Value, depth: usize) -> NifResult<Term<'a>> {
+    if depth > MAX_JSON_DEPTH {
+        return Err(rustler::Error::BadArg);
+    }
+
     match val {
-        serde_json::Value::Null => rustler::types::atom::nil().encode(env),
-        serde_json::Value::Bool(b) => b.encode(env),
+        serde_json::Value::Null => Ok(rustler::types::atom::nil().encode(env)),
+        serde_json::Value::Bool(b) => Ok(b.encode(env)),
         serde_json::Value::Number(n) => {
             if let Some(i) = n.as_i64() {
-                i.encode(env)
+                Ok(i.encode(env))
             } else if let Some(u) = n.as_u64() {
-                u.encode(env)
+                Ok(u.encode(env))
             } else if let Some(f) = n.as_f64() {
-                f.encode(env)
+                if f.is_finite() {
+                    Ok(f.encode(env))
+                } else {
+                    Err(rustler::Error::BadArg)
+                }
             } else {
-                n.to_string().encode(env)
+                Ok(n.to_string().encode(env))
             }
         }
-        serde_json::Value::String(s) => s.encode(env),
+        serde_json::Value::String(s) => Ok(s.encode(env)),
         serde_json::Value::Array(arr) => {
-            let terms: Vec<Term<'a>> = arr.iter().map(|v| json_to_term(env, v)).collect();
-            terms.encode(env)
+            let mut terms = Vec::with_capacity(arr.len());
+            for v in arr {
+                terms.push(json_to_term(env, v, depth + 1)?);
+            }
+            Ok(terms.encode(env))
         }
         serde_json::Value::Object(obj) => {
-            let mut map = Term::map_new(env);
-            for (k, v) in obj {
-                map = map.map_put(k.encode(env), json_to_term(env, v)).unwrap();
+            let mut keys = Vec::with_capacity(obj.len());
+            let mut vals = Vec::with_capacity(obj.len());
+            for (k_str, v) in obj {
+                keys.push(k_str.encode(env));
+                vals.push(json_to_term(env, v, depth + 1)?);
             }
-            map
+            Term::map_from_term_arrays(env, &keys, &vals)
         }
     }
 }
 
-fn decode_id(term: Term) -> Result<String, rustler::Error> {
-    if let Ok(s) = term.decode::<String>() {
-        Ok(s)
-    } else if let Ok(name) = term.atom_to_string() {
-        Ok(name)
-    } else if let Ok(i) = term.decode::<i64>() {
-        Ok(i.to_string())
+fn metadata_to_term<'a>(
+    env: Env<'a>,
+    meta: Option<&HashMap<String, serde_json::Value>>,
+) -> NifResult<Term<'a>> {
+    match meta {
+        None => Ok(rustler::types::atom::nil().encode(env)),
+        Some(map) => {
+            let mut keys = Vec::with_capacity(map.len());
+            let mut vals = Vec::with_capacity(map.len());
+            for (k_str, v) in map {
+                keys.push(k_str.encode(env));
+                vals.push(json_to_term(env, v, 1)?);
+            }
+            Term::map_from_term_arrays(env, &keys, &vals)
+        }
+    }
+}
+
+fn decode_finite_f32_vec(term: Term) -> Result<Vec<f32>, rustler::Error> {
+    let vec = term.decode::<Vec<f32>>()?;
+    if vec.iter().all(|x| x.is_finite()) {
+        Ok(vec)
     } else {
         Err(rustler::Error::BadArg)
     }
 }
 
-// Decode a vector entry from an Elixir term (map, struct, or raw vector)
+fn decode_id(term: Term) -> Result<String, rustler::Error> {
+    if let Ok(s) = term.decode::<String>() {
+        if s.is_empty() {
+            Err(rustler::Error::BadArg)
+        } else {
+            Ok(s)
+        }
+    } else if is_nil_or_bool(term) {
+        Err(rustler::Error::BadArg)
+    } else if let Ok(name) = term.atom_to_string() {
+        if name.is_empty() {
+            Err(rustler::Error::BadArg)
+        } else {
+            Ok(name)
+        }
+    } else if let Ok(i) = term.decode::<i64>() {
+        Ok(i.to_string())
+    } else if let Ok(u) = term.decode::<u64>() {
+        Ok(u.to_string())
+    } else if let Ok(i) = term.decode::<i128>() {
+        Ok(i.to_string())
+    } else if let Ok(u) = term.decode::<u128>() {
+        Ok(u.to_string())
+    } else {
+        Err(rustler::Error::BadArg)
+    }
+}
+
 fn decode_vector_entry(term: Term) -> Result<VectorEntry, rustler::Error> {
-    // If passed directly as a float list [1.0, 2.0, ...]
-    if let Ok(vec) = term.decode::<Vec<f32>>() {
+    if term.is_list() {
+        let vec = decode_finite_f32_vec(term)?;
         return Ok(VectorEntry {
             id: None,
             vector: vec,
@@ -143,49 +692,65 @@ fn decode_vector_entry(term: Term) -> Result<VectorEntry, rustler::Error> {
         let mut vector_val: Option<Vec<f32>> = None;
         let mut metadata_val: Option<HashMap<String, serde_json::Value>> = None;
 
+        let mut seen_id = false;
+        let mut seen_vector = false;
+        let mut seen_metadata = false;
+
         for (k_term, v_term) in map_iter {
             let key: String = if let Ok(s) = k_term.decode::<String>() {
                 s
             } else if let Ok(name) = k_term.atom_to_string() {
+                if name == "__struct__" {
+                    if v_term.atom_to_string().ok().as_deref()
+                        != Some("Elixir.RuvectorElixir.VectorEntry")
+                    {
+                        return Err(rustler::Error::BadArg);
+                    }
+                    continue;
+                }
                 name
             } else {
-                continue;
+                return Err(rustler::Error::BadArg);
             };
 
             match key.as_str() {
                 "id" => {
+                    if seen_id {
+                        return Err(rustler::Error::BadArg);
+                    }
+                    seen_id = true;
                     if rustler::types::atom::nil() == v_term {
                         id_val = None;
-                    } else if let Ok(s) = decode_id(v_term) {
-                        id_val = Some(s);
                     } else {
-                        return Err(rustler::Error::BadArg);
+                        id_val = Some(decode_id(v_term)?);
                     }
                 }
                 "vector" => {
-                    if let Ok(vec) = v_term.decode::<Vec<f32>>() {
-                        vector_val = Some(vec);
-                    } else {
+                    if seen_vector {
                         return Err(rustler::Error::BadArg);
                     }
+                    seen_vector = true;
+                    vector_val = Some(decode_finite_f32_vec(v_term)?);
                 }
                 "metadata" => {
-                    if rustler::types::atom::nil() == v_term {
-                        metadata_val = None;
-                    } else if let Ok(serde_json::Value::Object(obj)) = term_to_json(v_term) {
-                        metadata_val = Some(obj.into_iter().collect());
-                    } else {
+                    if seen_metadata {
                         return Err(rustler::Error::BadArg);
                     }
+                    seen_metadata = true;
+                    if rustler::types::atom::nil() == v_term {
+                        metadata_val = None;
+                    } else {
+                        metadata_val = Some(map_term_to_json_map(v_term, 1)?);
+                    }
                 }
-                _ => {}
+                _ => return Err(rustler::Error::BadArg),
             }
         }
 
-        if let Some(vector) = vector_val {
+        if let Some(vec_data) = vector_val {
             return Ok(VectorEntry {
                 id: id_val,
-                vector,
+                vector: vec_data,
                 metadata: metadata_val,
             });
         }
@@ -194,216 +759,298 @@ fn decode_vector_entry(term: Term) -> Result<VectorEntry, rustler::Error> {
     Err(rustler::Error::BadArg)
 }
 
-fn parse_metric_str(s: &str) -> DistanceMetric {
+fn parse_metric_str(s: &str) -> Result<DistanceMetric, String> {
     match s.to_lowercase().as_str() {
-        "euclidean" => DistanceMetric::Euclidean,
-        "cosine" => DistanceMetric::Cosine,
-        "dot_product" | "dotproduct" | "dot" => DistanceMetric::DotProduct,
-        "manhattan" => DistanceMetric::Manhattan,
-        _ => DistanceMetric::Cosine,
+        "euclidean" => Ok(DistanceMetric::Euclidean),
+        "cosine" => Ok(DistanceMetric::Cosine),
+        "dot_product" | "dotproduct" | "dot" => Ok(DistanceMetric::DotProduct),
+        "manhattan" => Ok(DistanceMetric::Manhattan),
+        _ => Err(format!("Unsupported distance metric: {}", s)),
     }
 }
 
-fn parse_metric(term: Term) -> DistanceMetric {
+fn parse_metric(term: Term) -> Result<DistanceMetric, String> {
+    if is_nil_or_bool(term) {
+        return Err("Invalid distance metric".to_string());
+    }
     if let Ok(s) = term.atom_to_string() {
         parse_metric_str(&s)
     } else if let Ok(s) = term.decode::<String>() {
         parse_metric_str(&s)
     } else {
-        DistanceMetric::Cosine
+        Err("Invalid distance metric".to_string())
     }
 }
 
-fn parse_quantization(term: Term) -> Option<QuantizationConfig> {
+fn decode_pos_usize(term: Term, field: &str) -> Result<usize, String> {
+    match term.decode::<usize>() {
+        Ok(val) if val > 0 => Ok(val),
+        _ => Err(format!("Option :{} must be a positive integer", field)),
+    }
+}
+
+fn parse_quantization(term: Term, dimensions: usize) -> Result<Option<QuantizationConfig>, String> {
     if rustler::types::atom::nil() == term {
-        return None;
+        return Ok(None);
+    }
+
+    if term.decode::<bool>().is_ok() {
+        return Err("Invalid :quantization option".to_string());
     }
 
     let q_str = if let Ok(s) = term.atom_to_string() {
         Some(s)
-    } else if let Ok(s) = term.decode::<String>() {
-        Some(s)
     } else {
-        None
+        term.decode::<String>().ok()
     };
 
     if let Some(s) = q_str {
         return match s.to_lowercase().as_str() {
-            "scalar" => Some(QuantizationConfig::Scalar),
-            "binary" => Some(QuantizationConfig::Binary),
-            "none" => Some(QuantizationConfig::None),
-            _ => None,
+            "scalar" => Ok(Some(QuantizationConfig::Scalar)),
+            "binary" => Ok(Some(QuantizationConfig::Binary)),
+            "none" => Ok(Some(QuantizationConfig::None)),
+            _ => Err(format!("Unsupported :quantization option: {}", s)),
         };
     }
 
     if let Some(map_iter) = rustler::types::map::MapIterator::new(term) {
-        let mut subspaces = 8usize;
-        let mut k = 256usize;
-        let mut is_product = false;
+        let mut q_type: Option<String> = None;
+        let mut subspaces_val: Option<usize> = None;
+        let mut k_val: Option<usize> = None;
 
         for (k_term, v_term) in map_iter {
-            let key: String = if let Ok(s) = k_term.decode::<String>() {
-                s
-            } else if let Ok(name) = k_term.atom_to_string() {
-                name
-            } else {
-                continue;
-            };
+            let key = decode_map_key(k_term)
+                .map_err(|_| "Invalid key in :quantization option".to_string())?;
 
             match key.as_str() {
                 "type" => {
-                    if let Ok(s) = v_term.decode::<String>() {
-                        if s.to_lowercase() == "scalar" {
-                            return Some(QuantizationConfig::Scalar);
-                        } else if s.to_lowercase() == "binary" {
-                            return Some(QuantizationConfig::Binary);
-                        } else if s.to_lowercase() == "product" {
-                            is_product = true;
-                        }
-                    } else if let Ok(name) = v_term.atom_to_string() {
-                        if name == "scalar" {
-                            return Some(QuantizationConfig::Scalar);
-                        } else if name == "binary" {
-                            return Some(QuantizationConfig::Binary);
-                        } else if name == "product" {
-                            is_product = true;
-                        }
+                    if q_type.is_some() {
+                        return Err("Duplicate :type in :quantization option".to_string());
                     }
+                    if is_nil_or_bool(v_term) {
+                        return Err("Invalid :type in :quantization option".to_string());
+                    }
+                    let t_str = if let Ok(s) = v_term.decode::<String>() {
+                        s
+                    } else if let Ok(name) = v_term.atom_to_string() {
+                        name
+                    } else {
+                        return Err("Invalid :type in :quantization option".to_string());
+                    };
+                    q_type = Some(t_str.to_lowercase());
                 }
                 "subspaces" => {
-                    if let Ok(val) = v_term.decode::<usize>() {
-                        subspaces = val;
-                        is_product = true;
+                    if subspaces_val.is_some() {
+                        return Err("Duplicate :subspaces in :quantization option".to_string());
                     }
+                    subspaces_val = Some(decode_pos_usize(v_term, "subspaces")?);
                 }
                 "k" => {
-                    if let Ok(val) = v_term.decode::<usize>() {
-                        k = val;
-                        is_product = true;
+                    if k_val.is_some() {
+                        return Err("Duplicate :k in :quantization option".to_string());
                     }
+                    k_val = Some(decode_pos_usize(v_term, "k")?);
                 }
-                _ => {}
+                other => {
+                    return Err(format!("Unknown :quantization option key: {}", other));
+                }
             }
         }
 
-        if is_product {
-            return Some(QuantizationConfig::Product { subspaces, k });
-        }
+        let build_product =
+            |sub: Option<usize>, k_opt: Option<usize>| -> Result<QuantizationConfig, String> {
+                let s = sub.unwrap_or(8);
+                if !dimensions.is_multiple_of(s) {
+                    return Err(format!(
+                        ":quantization :subspaces ({}) must evenly divide dimensions ({})",
+                        s, dimensions
+                    ));
+                }
+                Ok(QuantizationConfig::Product {
+                    subspaces: s,
+                    k: k_opt.unwrap_or(256),
+                })
+            };
+
+        return match q_type.as_deref() {
+            Some("product") => Ok(Some(build_product(subspaces_val, k_val)?)),
+            None if subspaces_val.is_some() || k_val.is_some() => {
+                Ok(Some(build_product(subspaces_val, k_val)?))
+            }
+            Some("scalar") if subspaces_val.is_none() && k_val.is_none() => {
+                Ok(Some(QuantizationConfig::Scalar))
+            }
+            Some("binary") if subspaces_val.is_none() && k_val.is_none() => {
+                Ok(Some(QuantizationConfig::Binary))
+            }
+            Some("none") if subspaces_val.is_none() && k_val.is_none() => {
+                Ok(Some(QuantizationConfig::None))
+            }
+            Some(other) if matches!(other, "scalar" | "binary" | "none") => Err(format!(
+                ":subspaces and :k are only valid with :product quantization, not :{}",
+                other
+            )),
+            Some(other) => Err(format!("Unsupported quantization type: {}", other)),
+            None => Err("Empty :quantization option map".to_string()),
+        };
     }
 
-    None
+    Err("Invalid :quantization option".to_string())
 }
 
-fn parse_db_options(path: String, dimensions: usize, opts_term: Option<Term>) -> DbOptions {
+fn parse_hnsw(term: Term) -> Result<Option<HnswConfig>, String> {
+    if rustler::types::atom::nil() == term {
+        return Ok(None);
+    }
+    if let Ok(b) = term.decode::<bool>() {
+        return if b {
+            Ok(Some(HnswConfig::default()))
+        } else {
+            Ok(None)
+        };
+    }
+    if let Some(hnsw_map) = rustler::types::map::MapIterator::new(term) {
+        let mut cfg = HnswConfig::default();
+        for (hk, hv) in hnsw_map {
+            let hkey = decode_map_key(hk).map_err(|_| "Invalid key in :hnsw option".to_string())?;
+            match hkey.as_str() {
+                "m" => {
+                    let val = decode_pos_usize(hv, "m")?;
+                    if !(2..=256).contains(&val) {
+                        return Err(format!("Option :m must be between 2 and 256, got: {}", val));
+                    }
+                    cfg.m = val;
+                }
+                "ef_construction" => cfg.ef_construction = decode_pos_usize(hv, "ef_construction")?,
+                "ef_search" => cfg.ef_search = decode_pos_usize(hv, "ef_search")?,
+                "max_elements" => cfg.max_elements = decode_pos_usize(hv, "max_elements")?,
+                other => return Err(format!("Unknown :hnsw option key: {}", other)),
+            }
+        }
+        return Ok(Some(cfg));
+    }
+
+    Err("Invalid :hnsw option".to_string())
+}
+
+fn parse_db_options(
+    path: String,
+    dimensions: usize,
+    opts_term: Option<Term>,
+) -> Result<DbOptions, String> {
+    if path.is_empty() {
+        return Err("Database path cannot be empty".to_string());
+    }
+    if dimensions == 0 {
+        return Err("Dimensions must be a positive integer".to_string());
+    }
+
     let mut distance_metric = DistanceMetric::Cosine;
+    let mut seen_metric = false;
     let mut hnsw_config = None;
     let mut quantization = None;
 
     if let Some(opts) = opts_term {
-        if let Some(map_iter) = rustler::types::map::MapIterator::new(opts) {
-            for (k, v) in map_iter {
-                let key: String = if let Ok(s) = k.decode::<String>() {
-                    s
-                } else if let Ok(name) = k.atom_to_string() {
-                    name
-                } else {
-                    continue;
-                };
+        if rustler::types::atom::nil() != opts {
+            let map_iter = rustler::types::map::MapIterator::new(opts)
+                .ok_or_else(|| "Database options must be a map".to_string())?;
+
+            for (k_term, v_term) in map_iter {
+                let key = decode_map_key(k_term).map_err(|_| "Invalid option key".to_string())?;
 
                 match key.as_str() {
                     "metric" | "distance_metric" => {
-                        distance_metric = parse_metric(v);
+                        if seen_metric {
+                            return Err(
+                                "Cannot specify both :metric and :distance_metric".to_string()
+                            );
+                        }
+                        seen_metric = true;
+                        distance_metric = parse_metric(v_term)?;
                     }
                     "hnsw" => {
-                        if let Ok(b) = v.decode::<bool>() {
-                            if b {
-                                hnsw_config = Some(HnswConfig::default());
-                            }
-                        } else if let Some(hnsw_map) = rustler::types::map::MapIterator::new(v) {
-                            let mut cfg = HnswConfig::default();
-                            for (hk, hv) in hnsw_map {
-                                let hkey: String = if let Ok(s) = hk.decode::<String>() {
-                                    s
-                                } else if let Ok(name) = hk.atom_to_string() {
-                                    name
-                                } else {
-                                    continue;
-                                };
-                                match hkey.as_str() {
-                                    "m" => {
-                                        if let Ok(val) = hv.decode::<usize>() {
-                                            cfg.m = val;
-                                        }
-                                    }
-                                    "ef_construction" => {
-                                        if let Ok(val) = hv.decode::<usize>() {
-                                            cfg.ef_construction = val;
-                                        }
-                                    }
-                                    "ef_search" => {
-                                        if let Ok(val) = hv.decode::<usize>() {
-                                            cfg.ef_search = val;
-                                        }
-                                    }
-                                    "max_elements" => {
-                                        if let Ok(val) = hv.decode::<usize>() {
-                                            cfg.max_elements = val;
-                                        }
-                                    }
-                                    _ => {}
-                                }
-                            }
-                            hnsw_config = Some(cfg);
-                        }
+                        hnsw_config = parse_hnsw(v_term)?;
                     }
                     "quantization" => {
-                        quantization = parse_quantization(v);
+                        quantization = parse_quantization(v_term, dimensions)?;
                     }
-                    _ => {}
+                    other => {
+                        return Err(format!("Unknown database option: {}", other));
+                    }
                 }
             }
         }
     }
 
-    DbOptions {
+    Ok(DbOptions {
         dimensions,
         distance_metric,
         storage_path: path,
         hnsw_config,
         quantization,
-    }
+    })
 }
 
 fn open_db_impl<'a>(
     env: Env<'a>,
-    path: String,
-    dimensions: usize,
+    path_term: Term<'a>,
+    dimensions_term: Term<'a>,
     options: Option<Term<'a>>,
 ) -> NifResult<Term<'a>> {
-    let opts = parse_db_options(path, dimensions, options);
+    let Ok(path) = path_term.decode::<String>() else {
+        return Ok((error(), "Database path must be a valid UTF-8 string").encode(env));
+    };
+    let Ok(dimensions) = dimensions_term.decode::<usize>() else {
+        return Ok((error(), "Dimensions must be a positive integer").encode(env));
+    };
 
-    match VectorDB::new(opts) {
-        Ok(db) => {
-            let resource = ResourceArc::new(DbResource { db });
+    let opts = match parse_db_options(path, dimensions, options) {
+        Ok(o) => o,
+        Err(msg) => return Ok((error(), msg).encode(env)),
+    };
+
+    let backend_res = if opts.storage_path.starts_with("memory://") {
+        InMemoryDB::new(opts).map(DbBackend::InMemory)
+    } else {
+        VectorDB::new(opts)
+            .map(DbBackend::Persistent)
+            .map_err(|e| e.to_string())
+    };
+
+    match backend_res {
+        Ok(backend) => {
+            let resource = ResourceArc::new(DbResource {
+                db: RwLock::new(Some(backend)),
+            });
             Ok((ok(), resource).encode(env))
         }
-        Err(err) => Ok((error(), err.to_string()).encode(env)),
+        Err(err) => Ok((error(), err).encode(env)),
     }
 }
 
 #[rustler::nif(schedule = "DirtyIo")]
-fn open_db<'a>(env: Env<'a>, path: String, dimensions: usize) -> NifResult<Term<'a>> {
+fn open_db<'a>(env: Env<'a>, path: Term<'a>, dimensions: Term<'a>) -> NifResult<Term<'a>> {
     open_db_impl(env, path, dimensions, None)
 }
 
 #[rustler::nif(schedule = "DirtyIo")]
 fn open_db_with_options<'a>(
     env: Env<'a>,
-    path: String,
-    dimensions: usize,
+    path: Term<'a>,
+    dimensions: Term<'a>,
     options: Option<Term<'a>>,
 ) -> NifResult<Term<'a>> {
     open_db_impl(env, path, dimensions, options)
+}
+
+#[rustler::nif(schedule = "DirtyIo")]
+fn close_db<'a>(env: Env<'a>, db_ref: ResourceArc<DbResource>) -> NifResult<Term<'a>> {
+    let mut guard = match db_ref.db.write() {
+        Ok(g) => g,
+        Err(_) => return Ok((error(), "Database lock poisoned").encode(env)),
+    };
+    *guard = None;
+    Ok(ok().encode(env))
 }
 
 #[rustler::nif(schedule = "DirtyIo")]
@@ -417,9 +1064,9 @@ fn insert<'a>(
         Err(_) => return Ok((error(), "Invalid vector entry format").encode(env)),
     };
 
-    match db_ref.db.insert(entry) {
-        Ok(id) => Ok((ok(), id).encode(env)),
-        Err(err) => Ok((error(), err.to_string()).encode(env)),
+    match with_db(&db_ref, |db| db.insert(entry)) {
+        Ok(id_str) => Ok((ok(), id_str).encode(env)),
+        Err(err) => Ok(err.encode(env)),
     }
 }
 
@@ -427,19 +1074,23 @@ fn insert<'a>(
 fn insert_batch<'a>(
     env: Env<'a>,
     db_ref: ResourceArc<DbResource>,
-    entries_term: Vec<Term<'a>>,
+    entries_term: Term<'a>,
 ) -> NifResult<Term<'a>> {
-    let mut entries = Vec::with_capacity(entries_term.len());
-    for t in entries_term {
+    let Ok(entries_list) = entries_term.decode::<Vec<Term<'a>>>() else {
+        return Ok((error(), "Vector batch must be a list").encode(env));
+    };
+
+    let mut entries = Vec::with_capacity(entries_list.len());
+    for t in entries_list {
         match decode_vector_entry(t) {
             Ok(e) => entries.push(e),
             Err(_) => return Ok((error(), "Invalid vector entry in batch").encode(env)),
         }
     }
 
-    match db_ref.db.insert_batch(entries) {
+    match with_db(&db_ref, |db| db.insert_batch(entries)) {
         Ok(ids) => Ok((ok(), ids).encode(env)),
-        Err(err) => Ok((error(), err.to_string()).encode(env)),
+        Err(err) => Ok(err.encode(env)),
     }
 }
 
@@ -454,26 +1105,22 @@ fn get_entry<'a>(
         Err(_) => return Ok((error(), "Invalid id format").encode(env)),
     };
 
-    match db_ref.db.get(&id_str) {
+    match with_db(&db_ref, |db| db.get(&id_str)) {
         Ok(Some(entry)) => {
-            let mut map = Term::map_new(env);
+            if !entry.vector.iter().all(|x| x.is_finite()) {
+                return Ok((error(), "Stored vector contains non-finite float").encode(env));
+            }
             let entry_id = entry.id.as_deref().unwrap_or(&id_str);
-            map = map.map_put(id().encode(env), entry_id.encode(env)).unwrap();
-            map = map
-                .map_put(vector().encode(env), entry.vector.encode(env))
-                .unwrap();
-            let meta_term = match entry.metadata {
-                Some(m) => {
-                    let json_obj = serde_json::Value::Object(m.into_iter().collect());
-                    json_to_term(env, &json_obj)
-                }
-                None => rustler::types::atom::nil().encode(env),
-            };
-            map = map.map_put(metadata().encode(env), meta_term).unwrap();
+            let meta_term = metadata_to_term(env, entry.metadata.as_ref())?;
+            let map = rustler::term_map!(env, {
+                id() => entry_id,
+                vector() => entry.vector,
+                metadata() => meta_term,
+            });
             Ok((ok(), map).encode(env))
         }
         Ok(None) => Ok((error(), not_found()).encode(env)),
-        Err(err) => Ok((error(), err.to_string()).encode(env)),
+        Err(err) => Ok(err.encode(env)),
     }
 }
 
@@ -488,80 +1135,106 @@ fn delete<'a>(
         Err(_) => return Ok((error(), "Invalid id format").encode(env)),
     };
 
-    match db_ref.db.delete(&id_str) {
+    match with_db(&db_ref, |db| db.delete(&id_str)) {
         Ok(deleted) => Ok((ok(), deleted).encode(env)),
-        Err(err) => Ok((error(), err.to_string()).encode(env)),
+        Err(err) => Ok(err.encode(env)),
     }
 }
 
-#[rustler::nif]
+#[rustler::nif(schedule = "DirtyIo")]
 fn db_len<'a>(env: Env<'a>, db_ref: ResourceArc<DbResource>) -> NifResult<Term<'a>> {
-    match db_ref.db.len() {
-        Ok(len) => Ok((ok(), len).encode(env)),
-        Err(err) => Ok((error(), err.to_string()).encode(env)),
+    match with_db(&db_ref, |db| db.len()) {
+        Ok(count) => Ok((ok(), count).encode(env)),
+        Err(err) => Ok(err.encode(env)),
     }
 }
 
-#[rustler::nif]
+#[rustler::nif(schedule = "DirtyIo")]
 fn is_empty<'a>(env: Env<'a>, db_ref: ResourceArc<DbResource>) -> NifResult<Term<'a>> {
-    match db_ref.db.is_empty() {
+    match with_db(&db_ref, |db| db.is_empty()) {
         Ok(empty) => Ok((ok(), empty).encode(env)),
-        Err(err) => Ok((error(), err.to_string()).encode(env)),
+        Err(err) => Ok(err.encode(env)),
     }
 }
 
 #[rustler::nif(schedule = "DirtyIo")]
 fn all_ids<'a>(env: Env<'a>, db_ref: ResourceArc<DbResource>) -> NifResult<Term<'a>> {
-    match db_ref.db.keys() {
+    match with_db(&db_ref, |db| db.keys()) {
         Ok(ids) => Ok((ok(), ids).encode(env)),
-        Err(err) => Ok((error(), err.to_string()).encode(env)),
+        Err(err) => Ok(err.encode(env)),
     }
 }
 
-fn extract_filter<'a>(filter: Option<Term<'a>>) -> Option<HashMap<String, serde_json::Value>> {
-    let f_term = filter?;
+fn extract_filter<'a>(
+    filter: Option<Term<'a>>,
+) -> Result<Option<HashMap<String, serde_json::Value>>, rustler::Error> {
+    let Some(f_term) = filter else {
+        return Ok(None);
+    };
+
     if rustler::types::atom::nil() == f_term {
-        return None;
+        return Ok(None);
     }
-    if let Ok(serde_json::Value::Object(obj)) = term_to_json(f_term) {
-        if obj.is_empty() {
-            None
+
+    if rustler::types::map::MapIterator::new(f_term).is_some() {
+        let map = map_term_to_json_map(f_term, 1)?;
+        return if map.is_empty() {
+            Ok(None)
         } else {
-            Some(obj.into_iter().collect())
+            Ok(Some(map))
+        };
+    }
+
+    if f_term.is_list() {
+        let list = f_term.decode::<Vec<(Term, Term)>>()?;
+        if list.is_empty() {
+            return Ok(None);
         }
-    } else if let Ok(list) = f_term.decode::<Vec<(Term, Term)>>() {
-        let mut map = HashMap::new();
+        let mut map = HashMap::with_capacity(list.len());
         for (k_term, v_term) in list {
             let key = if let Ok(s) = k_term.decode::<String>() {
                 s
+            } else if is_nil_or_bool(k_term) {
+                return Err(rustler::Error::BadArg);
             } else if let Ok(name) = k_term.atom_to_string() {
+                if name == "__struct__" {
+                    return Err(rustler::Error::BadArg);
+                }
                 name
             } else {
-                continue;
+                return Err(rustler::Error::BadArg);
             };
-            if let Ok(val) = term_to_json(v_term) {
-                map.insert(key, val);
-            }
+            let val = term_to_json(v_term)?;
+            // Match Elixir Keyword first-key-wins semantics on duplicate keys.
+            map.entry(key).or_insert(val);
         }
-        if map.is_empty() {
-            None
-        } else {
-            Some(map)
-        }
-    } else {
-        None
+        return Ok(Some(map));
     }
+
+    Err(rustler::Error::BadArg)
 }
 
 #[rustler::nif(schedule = "DirtyCpu")]
 fn search<'a>(
     env: Env<'a>,
     db_ref: ResourceArc<DbResource>,
-    query_vector: Vec<f32>,
+    query_vector_term: Term<'a>,
     filter: Option<Term<'a>>,
-    limit: usize,
+    limit_term: Term<'a>,
 ) -> NifResult<Term<'a>> {
-    let query_filter = extract_filter(filter);
+    let query_vector = match decode_finite_f32_vec(query_vector_term) {
+        Ok(v) => v,
+        Err(_) => return Ok((error(), "Invalid query vector").encode(env)),
+    };
+
+    let Ok(limit) = limit_term.decode::<usize>() else {
+        return Ok((error(), "Invalid search limit k").encode(env));
+    };
+
+    let query_filter = match extract_filter(filter) {
+        Ok(f) => f,
+        Err(_) => return Ok((error(), "Invalid filter format").encode(env)),
+    };
 
     let query = SearchQuery {
         vector: query_vector,
@@ -570,12 +1243,15 @@ fn search<'a>(
         ef_search: None,
     };
 
-    match db_ref.db.search(query) {
+    match with_db(&db_ref, |db| db.search(query)) {
         Ok(results) => {
+            if results.iter().any(|r| !r.score.is_finite()) {
+                return Ok((error(), "Search produced non-finite score").encode(env));
+            }
             let ids: Vec<String> = results.into_iter().map(|r| r.id).collect();
-            Ok(ids.encode(env))
+            Ok((ok(), ids).encode(env))
         }
-        Err(err) => Ok((error(), err.to_string()).encode(env)),
+        Err(err) => Ok(err.encode(env)),
     }
 }
 
@@ -583,139 +1259,160 @@ fn search<'a>(
 fn search_detailed<'a>(
     env: Env<'a>,
     db_ref: ResourceArc<DbResource>,
-    query_vector: Vec<f32>,
+    query_vector_term: Term<'a>,
     filter: Option<Term<'a>>,
-    limit: usize,
-    ef_search: Option<usize>,
+    limit_term: Term<'a>,
+    ef_search_term: Option<Term<'a>>,
 ) -> NifResult<Term<'a>> {
-    let query_filter = extract_filter(filter);
+    let query_vector = match decode_finite_f32_vec(query_vector_term) {
+        Ok(v) => v,
+        Err(_) => return Ok((error(), "Invalid query vector").encode(env)),
+    };
+
+    let Ok(limit) = limit_term.decode::<usize>() else {
+        return Ok((error(), "Invalid search limit k").encode(env));
+    };
+
+    let ef_search_arg = match ef_search_term {
+        None => None,
+        Some(t) if rustler::types::atom::nil() == t => None,
+        Some(t) => match decode_pos_usize(t, "ef_search") {
+            Ok(v) => Some(v),
+            Err(msg) => return Ok((error(), msg).encode(env)),
+        },
+    };
+
+    let query_filter = match extract_filter(filter) {
+        Ok(f) => f,
+        Err(_) => return Ok((error(), "Invalid filter format").encode(env)),
+    };
 
     let query = SearchQuery {
         vector: query_vector,
         k: limit,
         filter: query_filter,
-        ef_search,
+        ef_search: ef_search_arg,
     };
 
-    match db_ref.db.search(query) {
+    match with_db(&db_ref, |db| db.search(query)) {
         Ok(results) => {
-            let terms: Vec<Term<'a>> = results
-                .into_iter()
-                .map(|r| {
-                    let mut map = Term::map_new(env);
-                    map = map.map_put(id().encode(env), r.id.encode(env)).unwrap();
-                    map = map
-                        .map_put(score().encode(env), r.score.encode(env))
-                        .unwrap();
-                    let vec_term = match r.vector {
-                        Some(v) => v.encode(env),
-                        None => rustler::types::atom::nil().encode(env),
-                    };
-                    map = map.map_put(vector().encode(env), vec_term).unwrap();
-                    let meta_term = match r.metadata {
-                        Some(m) => {
-                            let json_obj = serde_json::Value::Object(m.into_iter().collect());
-                            json_to_term(env, &json_obj)
+            let mut terms = Vec::with_capacity(results.len());
+            for r in results {
+                if !r.score.is_finite() {
+                    return Ok((error(), "Search produced non-finite score").encode(env));
+                }
+                let vec_term = match r.vector {
+                    Some(v) => {
+                        if !v.iter().all(|x| x.is_finite()) {
+                            return Ok(
+                                (error(), "Stored vector contains non-finite float").encode(env)
+                            );
                         }
-                        None => rustler::types::atom::nil().encode(env),
-                    };
-                    map = map.map_put(metadata().encode(env), meta_term).unwrap();
-                    map
-                })
-                .collect();
+                        v.encode(env)
+                    }
+                    None => rustler::types::atom::nil().encode(env),
+                };
+                let meta_term = metadata_to_term(env, r.metadata.as_ref())?;
+                let map = rustler::term_map!(env, {
+                    id() => r.id,
+                    score() => r.score,
+                    vector() => vec_term,
+                    metadata() => meta_term,
+                });
+                terms.push(map);
+            }
             Ok((ok(), terms).encode(env))
         }
-        Err(err) => Ok((error(), err.to_string()).encode(env)),
+        Err(err) => Ok(err.encode(env)),
     }
 }
 
-#[rustler::nif]
+#[rustler::nif(schedule = "DirtyCpu")]
 fn calculate_distance<'a>(
     env: Env<'a>,
-    a: Vec<f32>,
-    b: Vec<f32>,
+    a_term: Term<'a>,
+    b_term: Term<'a>,
     metric_term: Term<'a>,
 ) -> NifResult<Term<'a>> {
-    let metric = parse_metric(metric_term);
+    let a = match decode_finite_f32_vec(a_term) {
+        Ok(v) => v,
+        Err(_) => return Ok((error(), "Invalid vector a").encode(env)),
+    };
+    let b = match decode_finite_f32_vec(b_term) {
+        Ok(v) => v,
+        Err(_) => return Ok((error(), "Invalid vector b").encode(env)),
+    };
+    let metric = match parse_metric(metric_term) {
+        Ok(m) => m,
+        Err(msg) => return Ok((error(), msg).encode(env)),
+    };
+
     match ruvector_core::distance::distance(&a, &b, metric) {
-        Ok(dist) => Ok((ok(), dist).encode(env)),
+        Ok(dist) if dist.is_finite() => Ok((ok(), dist).encode(env)),
+        Ok(_) => Ok((error(), "Distance calculation produced non-finite value").encode(env)),
         Err(err) => Ok((error(), err.to_string()).encode(env)),
     }
 }
 
-#[rustler::nif]
-fn info<'a>(env: Env<'a>, db_ref: ResourceArc<DbResource>) -> NifResult<Term<'a>> {
-    let len = db_ref.db.len().unwrap_or(0);
-    let options = db_ref.db.options();
-
-    let mut map = rustler::Term::map_new(env);
-    map = map
-        .map_put(
-            rustler::Encoder::encode(&"node_count", env),
-            rustler::Encoder::encode(&len, env),
-        )
-        .unwrap();
-    map = map
-        .map_put(
-            rustler::Encoder::encode(&"dimensions", env),
-            rustler::Encoder::encode(&options.dimensions, env),
-        )
-        .unwrap();
-    let metric_str = match options.distance_metric {
-        ruvector_core::types::DistanceMetric::Euclidean => "euclidean",
-        ruvector_core::types::DistanceMetric::Cosine => "cosine",
-        ruvector_core::types::DistanceMetric::DotProduct => "dot_product",
-        ruvector_core::types::DistanceMetric::Manhattan => "manhattan",
-    };
-    map = map
-        .map_put(
-            rustler::Encoder::encode(&"distance_metric", env),
-            rustler::Encoder::encode(&metric_str, env),
-        )
-        .unwrap();
-    map = map
-        .map_put(
-            rustler::Encoder::encode(&"storage_path", env),
-            rustler::Encoder::encode(&options.storage_path, env),
-        )
-        .unwrap();
-
-    let hnsw_term = match &options.hnsw_config {
-        Some(cfg) => {
-            let mut hmap = rustler::Term::map_new(env);
-            hmap = hmap
-                .map_put(
-                    rustler::Encoder::encode(&"m", env),
-                    rustler::Encoder::encode(&cfg.m, env),
-                )
-                .unwrap();
-            hmap = hmap
-                .map_put(
-                    rustler::Encoder::encode(&"ef_construction", env),
-                    rustler::Encoder::encode(&cfg.ef_construction, env),
-                )
-                .unwrap();
-            hmap = hmap
-                .map_put(
-                    rustler::Encoder::encode(&"ef_search", env),
-                    rustler::Encoder::encode(&cfg.ef_search, env),
-                )
-                .unwrap();
-            hmap = hmap
-                .map_put(
-                    rustler::Encoder::encode(&"max_elements", env),
-                    rustler::Encoder::encode(&cfg.max_elements, env),
-                )
-                .unwrap();
-            hmap
-        }
-        None => rustler::types::atom::nil().encode(env),
-    };
-    map = map
-        .map_put(rustler::Encoder::encode(&"hnsw", env), hnsw_term)
-        .unwrap();
-
-    Ok(map)
+fn encode_metric_atom<'a>(env: Env<'a>, metric: DistanceMetric) -> Term<'a> {
+    match metric {
+        DistanceMetric::Euclidean => euclidean().encode(env),
+        DistanceMetric::Cosine => cosine().encode(env),
+        DistanceMetric::DotProduct => dot_product().encode(env),
+        DistanceMetric::Manhattan => manhattan().encode(env),
+    }
 }
 
-rustler::init!("Elixir.RuvectorElixir", load = load);
+fn encode_quantization_term<'a>(env: Env<'a>, quant: Option<&QuantizationConfig>) -> Term<'a> {
+    match quant {
+        None => rustler::types::atom::nil().encode(env),
+        Some(QuantizationConfig::None) => none().encode(env),
+        Some(QuantizationConfig::Scalar) => scalar().encode(env),
+        Some(QuantizationConfig::Binary) => binary().encode(env),
+        Some(QuantizationConfig::Product {
+            subspaces: sub,
+            k: k_size,
+        }) => rustler::term_map!(env, {
+            type_() => product(),
+            subspaces() => *sub,
+            k() => *k_size,
+        }),
+    }
+}
+
+#[rustler::nif(schedule = "DirtyIo")]
+fn info<'a>(env: Env<'a>, db_ref: ResourceArc<DbResource>) -> NifResult<Term<'a>> {
+    let snapshot = with_db(&db_ref, |db| {
+        let count = db.len()?;
+        let opts = db.options().clone();
+        Ok((count, opts))
+    });
+
+    match snapshot {
+        Ok((count, opts)) => {
+            let hnsw_term = match &opts.hnsw_config {
+                Some(cfg) => rustler::term_map!(env, {
+                    m() => cfg.m,
+                    ef_construction() => cfg.ef_construction,
+                    ef_search() => cfg.ef_search,
+                    max_elements() => cfg.max_elements,
+                }),
+                None => rustler::types::atom::nil().encode(env),
+            };
+
+            let map = rustler::term_map!(env, {
+                node_count() => count,
+                dimensions() => opts.dimensions,
+                distance_metric() => encode_metric_atom(env, opts.distance_metric),
+                storage_path() => opts.storage_path,
+                hnsw() => hnsw_term,
+                quantization() => encode_quantization_term(env, opts.quantization.as_ref()),
+            });
+
+            Ok((ok(), map).encode(env))
+        }
+        Err(err) => Ok(err.encode(env)),
+    }
+}
+
+rustler::init!("Elixir.RuvectorElixir.Native");

@@ -4,29 +4,27 @@ defmodule RuvectorElixir do
 
   Provides sub-millisecond approximate nearest neighbor (ANN) search via HNSW or exact flat indexing,
   supporting multiple distance metrics (cosine, euclidean, dot product, manhattan), metadata filtering,
-  and ACID-compliant on-disk persistence as well as pure in-memory databases (`memory://`).
+  on-disk persistence via `redb`, and isolated in-memory databases (`memory://`).
 
   ## Architecture
 
   `RuvectorElixir` uses [Rustler](https://github.com/rusterlium/rustler) to interface directly with
-  the `ruvector-core` Rust engine via dirty schedulers (`DirtyIo` and `DirtyCpu`) to avoid blocking
-  the Erlang VM's normal scheduler threads.
+  `ruvector-core` on Erlang dirty schedulers (`DirtyIo` and `DirtyCpu`) so BEAM normal schedulers
+  are never blocked.
 
   ## Features
 
   - **Vector Operations**: Insertion (single & batch), retrieval by ID, deletion, key enumeration.
   - **Distance Metrics**: Cosine similarity, Euclidean (L2), Dot product, Manhattan (L1).
-  - **Search**: Fast k-nearest neighbor search with optional metadata JSON filtering and `ef_search` parameter.
+  - **Search**: Fast k-nearest neighbor search with optional metadata filtering and `ef_search` tuning.
   - **HNSW Indexing**: Configurable `m`, `ef_construction`, and `ef_search` parameters for graph-based ANN indexing.
-  - **In-Memory & Persistent Storage**: Sled/disk backed `.rvf` storage or pure in-memory `memory://<name>` databases.
-  - **Quantization**: Support for scalar and binary quantization configurations.
+  - **In-Memory & Persistent Storage**: Disk-backed `.rvf` storage or pure in-memory `memory://<name>` databases.
+  - **Explicit Lifecycle**: Deterministic `close/1` to release database handles immediately.
   """
 
-  use Rustler, otp_app: :ruvector_elixir, crate: "ruvector_nif"
+  alias RuvectorElixir.{Error, Native, VectorEntry}
 
-  alias RuvectorElixir.VectorEntry
-
-  @type db_ref :: reference()
+  @opaque db_ref :: reference()
   @type vector :: [number()]
   @type id_input :: String.t() | atom() | integer()
   @type metric :: :cosine | :euclidean | :dot_product | :dot | :manhattan | String.t()
@@ -42,7 +40,7 @@ defmodule RuvectorElixir do
           | :none
           | String.t()
           | %{
-              optional(:type) => :scalar | :binary | :product | String.t(),
+              optional(:type) => :scalar | :binary | :none | :product | String.t(),
               optional(:subspaces) => pos_integer(),
               optional(:k) => pos_integer()
             }
@@ -60,18 +58,36 @@ defmodule RuvectorElixir do
   @type entry_input ::
           VectorEntry.t()
           | %{
-              optional(:id) => id_input(),
-              optional(:vector) => vector(),
+              required(:vector) => vector(),
+              optional(:id) => id_input() | nil,
               optional(:metadata) => map() | nil
             }
           | vector()
-
+  @type search_filter :: map() | keyword() | nil
+  @type search_option :: {:filter, search_filter()}
+  @type search_detailed_option :: {:filter, search_filter()} | {:ef_search, pos_integer() | nil}
   @type search_result :: %{
           id: String.t(),
           score: float(),
           vector: [float()] | nil,
           metadata: map() | nil
         }
+  @type db_info :: %{
+          node_count: non_neg_integer(),
+          dimensions: pos_integer(),
+          distance_metric: :cosine | :euclidean | :dot_product | :manhattan,
+          storage_path: String.t(),
+          hnsw: hnsw_options() | nil,
+          quantization:
+            :none
+            | :scalar
+            | :binary
+            | %{type: :product, subspaces: pos_integer(), k: pos_integer()}
+            | nil
+        }
+
+  @valid_metrics [:cosine, :euclidean, :dot_product, :dot, :manhattan]
+  @valid_metric_strings ["cosine", "euclidean", "dot_product", "dotproduct", "dot", "manhattan"]
 
   # ============================================================================
   # Database Lifecycle
@@ -80,21 +96,27 @@ defmodule RuvectorElixir do
   @doc """
   Opens or creates a ruvector database at `path` with the specified vector `dimensions` and optional configuration `options`.
 
-  Options can be supplied as either a map or a keyword list.
+  Options can be supplied as either a plain map or a keyword list. Invalid option keys or values
+  raise `ArgumentError`.
 
   ## Options
 
   - `:metric` / `:distance_metric` - Distance metric to use (`:cosine`, `:euclidean`, `:dot_product`, `:manhattan`). Default: `:cosine`.
-  - `:hnsw` - Either a boolean `true` for default HNSW index parameters, or a map/keyword list with:
-    - `:m` - Number of bi-directional links created per node (default: 16).
-    - `:ef_construction` - Size of dynamic candidate list during construction (default: 100).
-    - `:ef_search` - Size of dynamic candidate list during search (default: 50).
-    - `:max_elements` - Initial capacity of the graph index (default: 1_000_000).
-  - `:quantization` - Optional quantization configuration (`:scalar`, `:binary`, `:none`, or product map).
+  - `:hnsw` - Either a boolean (`true` for default HNSW index parameters, `false` for flat index), or a map/keyword list with:
+    - `:m` - Number of bi-directional links created per node (`2..256`, default: `16`).
+    - `:ef_construction` - Size of dynamic candidate list during construction (default: `100`).
+    - `:ef_search` - Size of dynamic candidate list during search (default: `100`).
+    - `:max_elements` - Initial capacity of the graph index (default: `1_000_000`).
+  - `:quantization` - Optional quantization configuration (`:scalar`, `:binary`, `:none`, or `%{type: :product, subspaces: pos_integer(), k: pos_integer()}` where `subspaces` must evenly divide `dimensions`).
+    Note: upstream `ruvector-core` 2.3.0 persists and reports `:quantization` in config/info, but stores vectors in `f32` precision without applying compression yet (`ruvnet/RuVector#563`).
+
+  Vectors are stored internally as 32-bit IEEE 754 floats (`f32`); non-dyadic 64-bit Elixir floats
+  are rounded to `f32` precision on insert and widened back to `f64` on read.
 
   ## In-Memory Databases
 
-  Use a path prefixed with `memory://` (e.g. `memory://my_session`) for a non-persisted in-memory database.
+  Use a path prefixed with `memory://` (e.g. `"memory://transient"`) for a pure in-memory database
+  that does not touch the filesystem.
 
   ## Examples
 
@@ -106,42 +128,51 @@ defmodule RuvectorElixir do
   @spec open(Path.t(), pos_integer(), db_options() | keyword()) ::
           {:ok, db_ref()} | {:error, String.t()}
   def open(path, dimensions, options \\ %{})
-      when is_binary(path) and is_integer(dimensions) and dimensions > 0 do
-    open_db_with_options(path, dimensions, normalize_options(options))
+
+  def open(path, dimensions, options)
+      when is_binary(path) and byte_size(path) > 0 and is_integer(dimensions) and dimensions > 0 do
+    if not String.valid?(path) do
+      raise ArgumentError, "Database path must be a valid UTF-8 string"
+    end
+
+    Native.open_db_with_options(path, dimensions, normalize_options!(options, dimensions))
+  end
+
+  def open(path, dimensions, _options) do
+    raise ArgumentError,
+          "Invalid arguments to RuvectorElixir.open/3: expected non-empty binary path and positive integer dimensions, got path=#{inspect(path)}, dimensions=#{inspect(dimensions)}"
   end
 
   @doc """
-  Opens a database, raising `RuntimeError` on failure.
+  Opens a database, raising `RuvectorElixir.Error` on operational failure or `ArgumentError` on invalid arguments.
   """
   @spec open!(Path.t(), pos_integer(), db_options() | keyword()) :: db_ref()
   def open!(path, dimensions, options \\ %{}) do
     case open(path, dimensions, options) do
       {:ok, db} -> db
-      {:error, reason} -> raise RuntimeError, "Failed to open database: #{reason}"
+      {:error, reason} -> raise Error, reason
     end
   end
 
   @doc """
-  Opens a ruvector database at `path` with `dimensions`.
+  Closes a database handle, releasing its underlying Rust database resources immediately.
 
-  Equivalent to `open(path, dimensions, %{})`.
+  Idempotent: calling `close/1` on an already-closed handle returns `:ok`.
+  Subsequent operations on a closed handle return `{:error, :closed}`.
   """
-  @spec open_db(Path.t(), pos_integer()) :: {:ok, db_ref()} | {:error, String.t()}
-  def open_db(_path, _dimensions), do: :erlang.nif_error(:nif_not_loaded)
-
-  @doc """
-  Opens a ruvector database with configuration options.
-  """
-  @spec open_db(Path.t(), pos_integer(), db_options() | keyword()) ::
-          {:ok, db_ref()} | {:error, String.t()}
-  def open_db(path, dimensions, options), do: open(path, dimensions, options)
+  @spec close(db_ref()) :: :ok | {:error, String.t()}
+  def close(db_ref) when is_reference(db_ref), do: Native.close_db(db_ref)
 
   @doc """
-  Native NIF: Opens a ruvector database with optional settings map.
+  Closes a database handle, raising `RuvectorElixir.Error` on failure.
   """
-  @spec open_db_with_options(Path.t(), pos_integer(), db_options() | nil) ::
-          {:ok, db_ref()} | {:error, String.t()}
-  def open_db_with_options(_path, _dimensions, _options), do: :erlang.nif_error(:nif_not_loaded)
+  @spec close!(db_ref()) :: :ok
+  def close!(db_ref) do
+    case close(db_ref) do
+      :ok -> :ok
+      {:error, reason} -> raise Error, reason
+    end
+  end
 
   # ============================================================================
   # Insert & Storage Operations
@@ -156,24 +187,18 @@ defmodule RuvectorElixir do
   - A raw list of numbers `[1.0, 2.0, ...]` (in which case a UUID is automatically assigned).
 
   Returns `{:ok, id}` on success, or `{:error, reason}` on failure.
-
-  ## Examples
-
-      {:ok, id} = RuvectorElixir.insert(db, [0.1, 0.2, 0.3])
-      {:ok, "doc_1"} = RuvectorElixir.insert(db, %{id: "doc_1", vector: [0.1, 0.2, 0.3], metadata: %{"author" => "Alice"}})
-
   """
-  @spec insert(db_ref(), entry_input()) :: {:ok, String.t()} | {:error, String.t()}
-  def insert(_db_ref, _entry), do: :erlang.nif_error(:nif_not_loaded)
+  @spec insert(db_ref(), entry_input()) :: {:ok, String.t()} | {:error, :closed | String.t()}
+  def insert(db_ref, entry) when is_reference(db_ref), do: Native.insert(db_ref, entry)
 
   @doc """
-  Inserts a vector entry into the database, raising `ArgumentError` on failure.
+  Inserts a vector entry into the database, raising `RuvectorElixir.Error` on failure.
   """
   @spec insert!(db_ref(), entry_input()) :: String.t()
   def insert!(db_ref, entry) do
     case insert(db_ref, entry) do
       {:ok, id} -> id
-      {:error, reason} -> raise ArgumentError, reason
+      {:error, reason} -> raise Error, reason
     end
   end
 
@@ -181,136 +206,110 @@ defmodule RuvectorElixir do
   Inserts a batch of vector entries into the database.
 
   Returns `{:ok, [id]}` on success, or `{:error, reason}` on failure.
-
-  ## Examples
-
-      entries = [
-        %{id: "v1", vector: [0.1, 0.2, 0.3]},
-        %{id: "v2", vector: [0.4, 0.5, 0.6]}
-      ]
-      {:ok, ["v1", "v2"]} = RuvectorElixir.insert_batch(db, entries)
-
   """
-  @spec insert_batch(db_ref(), [entry_input()]) :: {:ok, [String.t()]} | {:error, String.t()}
-  def insert_batch(_db_ref, _entries), do: :erlang.nif_error(:nif_not_loaded)
+  @spec insert_batch(db_ref(), [entry_input()]) ::
+          {:ok, [String.t()]} | {:error, :closed | String.t()}
+  def insert_batch(db_ref, entries) when is_reference(db_ref) and is_list(entries) do
+    Native.insert_batch(db_ref, entries)
+  end
 
   @doc """
-  Inserts a batch of vector entries into the database, raising `ArgumentError` on failure.
+  Inserts a batch of vector entries into the database, raising `RuvectorElixir.Error` on failure.
   """
   @spec insert_batch!(db_ref(), [entry_input()]) :: [String.t()]
   def insert_batch!(db_ref, entries) do
     case insert_batch(db_ref, entries) do
       {:ok, ids} -> ids
-      {:error, reason} -> raise ArgumentError, reason
+      {:error, reason} -> raise Error, reason
     end
   end
 
   @doc """
-  Retrieves a vector entry by its ID (string, atom, or integer).
+  Retrieves a vector entry by its ID (string, non-boolean atom, or integer).
 
   Returns `{:ok, %{id: id, vector: vector, metadata: metadata}}` if found,
-  `{:error, :not_found}` if no entry with that ID exists, or `{:error, reason}` on failure.
-  """
-  @spec get_entry(db_ref(), id_input()) ::
-          {:ok, entry_map()} | {:error, :not_found} | {:error, String.t()}
-  def get_entry(_db_ref, _id), do: :erlang.nif_error(:nif_not_loaded)
-
-  @doc """
-  Retrieves a vector entry, raising `RuntimeError` if not found or if an error occurs.
-  """
-  @spec get_entry!(db_ref(), id_input()) :: entry_map()
-  def get_entry!(db_ref, id) do
-    case get_entry(db_ref, id) do
-      {:ok, entry} -> entry
-      {:error, :not_found} -> raise RuntimeError, "Vector entry with id #{inspect(id)} not found"
-      {:error, reason} -> raise RuntimeError, reason
-    end
-  end
-
-  @doc """
-  Convenience alias for `get_entry/2`.
+  `{:error, :not_found}` if no entry with that ID exists, `{:error, :closed}` if closed,
+  or `{:error, reason}` on failure.
   """
   @spec get(db_ref(), id_input()) ::
-          {:ok, entry_map()} | {:error, :not_found} | {:error, String.t()}
-  def get(db_ref, id), do: get_entry(db_ref, id)
+          {:ok, entry_map()} | {:error, :not_found | :closed | String.t()}
+  def get(db_ref, id) when is_reference(db_ref), do: Native.get_entry(db_ref, id)
 
   @doc """
-  Convenience alias for `get_entry!/2`.
+  Retrieves a vector entry, raising `RuvectorElixir.Error` if not found or if an error occurs.
   """
   @spec get!(db_ref(), id_input()) :: entry_map()
-  def get!(db_ref, id), do: get_entry!(db_ref, id)
+  def get!(db_ref, id) do
+    case get(db_ref, id) do
+      {:ok, entry} -> entry
+      {:error, reason} -> raise Error, reason
+    end
+  end
 
   @doc """
   Retrieves a vector entry and returns it as a `RuvectorElixir.VectorEntry` struct.
   """
   @spec get_struct(db_ref(), id_input()) ::
-          {:ok, VectorEntry.t()} | {:error, :not_found} | {:error, String.t()}
+          {:ok, VectorEntry.t()} | {:error, :not_found | :closed | String.t()}
   def get_struct(db_ref, id) do
-    case get_entry(db_ref, id) do
+    case get(db_ref, id) do
       {:ok, entry_map} -> {:ok, VectorEntry.from_map(entry_map)}
-      error -> error
+      {:error, _} = error -> error
     end
   end
 
   @doc """
-  Retrieves a vector entry as a `VectorEntry` struct, raising `RuntimeError` if not found or on error.
+  Retrieves a vector entry as a `VectorEntry` struct, raising `RuvectorElixir.Error` on failure.
   """
   @spec get_struct!(db_ref(), id_input()) :: VectorEntry.t()
   def get_struct!(db_ref, id) do
     case get_struct(db_ref, id) do
       {:ok, struct} -> struct
-      {:error, :not_found} -> raise RuntimeError, "Vector entry with id #{inspect(id)} not found"
-      {:error, reason} -> raise RuntimeError, reason
+      {:error, reason} -> raise Error, reason
     end
   end
 
   @doc """
-  Deletes an entry by its ID (string, atom, or integer).
+  Deletes an entry by its ID (string, non-boolean atom, or integer).
 
   Returns `{:ok, true}` if deleted, `{:ok, false}` if not found, or `{:error, reason}` on failure.
   """
-  @spec delete(db_ref(), id_input()) :: {:ok, boolean()} | {:error, String.t()}
-  def delete(_db_ref, _id), do: :erlang.nif_error(:nif_not_loaded)
+  @spec delete(db_ref(), id_input()) :: {:ok, boolean()} | {:error, :closed | String.t()}
+  def delete(db_ref, id) when is_reference(db_ref), do: Native.delete(db_ref, id)
 
   @doc """
-  Deletes an entry by its ID, raising `RuntimeError` on failure.
+  Deletes an entry by its ID, raising `RuvectorElixir.Error` on failure.
   """
   @spec delete!(db_ref(), id_input()) :: boolean()
   def delete!(db_ref, id) do
     case delete(db_ref, id) do
       {:ok, deleted} -> deleted
-      {:error, reason} -> raise RuntimeError, reason
+      {:error, reason} -> raise Error, reason
     end
   end
 
   @doc """
   Returns the total number of vectors in the database.
   """
-  @spec db_len(db_ref()) :: {:ok, non_neg_integer()} | {:error, String.t()}
-  def db_len(_db_ref), do: :erlang.nif_error(:nif_not_loaded)
+  @spec len(db_ref()) :: {:ok, non_neg_integer()} | {:error, :closed | String.t()}
+  def len(db_ref) when is_reference(db_ref), do: Native.db_len(db_ref)
 
   @doc """
-  Convenience alias for `db_len/1`.
-  """
-  @spec len(db_ref()) :: {:ok, non_neg_integer()} | {:error, String.t()}
-  def len(db_ref), do: db_len(db_ref)
-
-  @doc """
-  Returns the total number of vectors in the database, raising on error.
+  Returns the total number of vectors in the database, raising `RuvectorElixir.Error` on error.
   """
   @spec len!(db_ref()) :: non_neg_integer()
   def len!(db_ref) do
     case len(db_ref) do
-      {:ok, count} -> count
-      {:error, reason} -> raise RuntimeError, reason
+      {:ok, total} -> total
+      {:error, reason} -> raise Error, reason
     end
   end
 
   @doc """
-  Convenience alias for `db_len/1`.
+  Convenience alias for `len/1`.
   """
-  @spec count(db_ref()) :: {:ok, non_neg_integer()} | {:error, String.t()}
-  def count(db_ref), do: db_len(db_ref)
+  @spec count(db_ref()) :: {:ok, non_neg_integer()} | {:error, :closed | String.t()}
+  def count(db_ref), do: len(db_ref)
 
   @doc """
   Convenience alias for `len!/1`.
@@ -320,36 +319,31 @@ defmodule RuvectorElixir do
 
   @doc """
   Checks if the database is empty.
-  """
-  @spec is_empty(db_ref()) :: {:ok, boolean()} | {:error, String.t()}
-  def is_empty(_db_ref), do: :erlang.nif_error(:nif_not_loaded)
 
-  @doc """
-  Convenience alias for `is_empty/1`.
+  Returns `true` or `false`, raising `RuvectorElixir.Error` on failure (such as `:closed`).
   """
-  @spec empty?(db_ref()) :: {:ok, boolean()} | {:error, String.t()}
-  def empty?(db_ref), do: is_empty(db_ref)
+  @spec empty?(db_ref()) :: boolean()
+  def empty?(db_ref) when is_reference(db_ref) do
+    case Native.is_empty(db_ref) do
+      {:ok, empty} -> empty
+      {:error, reason} -> raise Error, reason
+    end
+  end
 
   @doc """
   Returns a list of all vector IDs currently stored in the database.
   """
-  @spec all_ids(db_ref()) :: {:ok, [String.t()]} | {:error, String.t()}
-  def all_ids(_db_ref), do: :erlang.nif_error(:nif_not_loaded)
+  @spec keys(db_ref()) :: {:ok, [String.t()]} | {:error, :closed | String.t()}
+  def keys(db_ref) when is_reference(db_ref), do: Native.all_ids(db_ref)
 
   @doc """
-  Convenience alias for `all_ids/1`.
-  """
-  @spec keys(db_ref()) :: {:ok, [String.t()]} | {:error, String.t()}
-  def keys(db_ref), do: all_ids(db_ref)
-
-  @doc """
-  Returns all vector IDs in the database, raising on error.
+  Returns all vector IDs in the database, raising `RuvectorElixir.Error` on error.
   """
   @spec keys!(db_ref()) :: [String.t()]
   def keys!(db_ref) do
     case keys(db_ref) do
       {:ok, ids} -> ids
-      {:error, reason} -> raise RuntimeError, reason
+      {:error, reason} -> raise Error, reason
     end
   end
 
@@ -360,94 +354,90 @@ defmodule RuvectorElixir do
   @doc """
   Searches the database for the top `k` closest vectors to `query_vector`.
 
-  Returns a list of matching vector ID strings, or `{:error, reason}` on failure.
+  ## Options
+
+  - `:filter` - Optional metadata filter map or keyword list (default: `nil`).
+
+  Returns `{:ok, [id]}` on success, or `{:error, reason}` on failure.
   """
-  @spec search(db_ref(), vector(), pos_integer()) :: [String.t()] | {:error, String.t()}
-  def search(db_ref, query_vector, k), do: search(db_ref, query_vector, nil, k)
+  @spec search(db_ref(), vector(), non_neg_integer(), [search_option()] | map()) ::
+          {:ok, [String.t()]} | {:error, :closed | String.t()}
+  def search(db_ref, query_vector, k, opts \\ [])
 
-  @doc """
-  Searches the database for the top `k` closest vectors matching the optional `filter`.
+  def search(db_ref, query_vector, k, opts)
+      when is_reference(db_ref) and is_list(query_vector) and is_integer(k) and k >= 0 do
+    %{filter: filter} = validate_search_opts!(opts, [:filter])
+    Native.search(db_ref, query_vector, filter, k)
+  end
 
-  Filter can be a map or a keyword list.
-
-  Returns a list of matching vector ID strings, or `{:error, reason}` on failure.
-  """
-  @spec search(db_ref(), vector(), map() | keyword() | nil, pos_integer()) ::
-          [String.t()] | {:error, String.t()}
-  def search(_db_ref, _query_vector, _filter, _k), do: :erlang.nif_error(:nif_not_loaded)
-
-  @doc """
-  Searches the database for top `k` closest vectors, raising `ArgumentError` on failure.
-  """
-  @spec search!(db_ref(), vector(), pos_integer()) :: [String.t()]
-  def search!(db_ref, query_vector, k) do
-    search!(db_ref, query_vector, nil, k)
+  def search(_db_ref, _query_vector, k, _opts) do
+    raise ArgumentError,
+          "Invalid arguments to RuvectorElixir.search/4: expected db_ref, list vector, and non-negative integer k, got k=#{inspect(k)}"
   end
 
   @doc """
-  Searches the database for top `k` closest vectors with filter, raising `ArgumentError` on failure.
+  Searches the database for top `k` closest vectors, raising `RuvectorElixir.Error` on operational
+  failure or `ArgumentError` on invalid arguments.
   """
-  @spec search!(db_ref(), vector(), map() | keyword() | nil, pos_integer()) :: [String.t()]
-  def search!(db_ref, query_vector, filter, k) do
-    case search(db_ref, query_vector, filter, k) do
-      {:error, reason} -> raise ArgumentError, reason
-      ids when is_list(ids) -> ids
+  @spec search!(db_ref(), vector(), non_neg_integer(), [search_option()] | map()) :: [String.t()]
+  def search!(db_ref, query_vector, k, opts \\ []) do
+    case search(db_ref, query_vector, k, opts) do
+      {:ok, ids} -> ids
+      {:error, reason} -> raise Error, reason
     end
   end
 
   @doc """
   Searches the database for top `k` closest vectors, returning detailed search result maps.
 
+  ## Options
+
+  - `:filter` - Optional metadata filter map or keyword list (default: `nil`).
+  - `:ef_search` - Optional positive integer HNSW `ef_search` override (default: `nil`).
+
   Each result map contains:
   - `:id` - Vector ID string
   - `:score` - Similarity / distance score (lower is closer for distance metrics)
-  - `:vector` - Vector embedding float list (or nil)
-  - `:metadata` - Metadata map (or nil)
-  """
-  @spec search_detailed(db_ref(), vector(), pos_integer()) ::
-          {:ok, [search_result()]} | {:error, String.t()}
-  def search_detailed(db_ref, query_vector, k) do
-    search_detailed(db_ref, query_vector, nil, k, nil)
-  end
-
-  @doc """
-  Searches the database with a metadata filter, returning detailed search results.
-  """
-  @spec search_detailed(db_ref(), vector(), map() | keyword() | nil, pos_integer()) ::
-          {:ok, [search_result()]} | {:error, String.t()}
-  def search_detailed(db_ref, query_vector, filter, k) do
-    search_detailed(db_ref, query_vector, filter, k, nil)
-  end
-
-  @doc """
-  Native NIF: Searches the database with a filter and optional HNSW `ef_search` override.
+  - `:vector` - Vector embedding float list (or `nil`)
+  - `:metadata` - Metadata map (or `nil`)
   """
   @spec search_detailed(
           db_ref(),
           vector(),
-          map() | keyword() | nil,
-          pos_integer(),
-          pos_integer() | nil
+          non_neg_integer(),
+          [search_detailed_option()] | map()
         ) ::
-          {:ok, [search_result()]} | {:error, String.t()}
-  def search_detailed(_db_ref, _query_vector, _filter, _k, _ef_search) do
-    :erlang.nif_error(:nif_not_loaded)
+          {:ok, [search_result()]} | {:error, :closed | String.t()}
+  def search_detailed(db_ref, query_vector, k, opts \\ [])
+
+  def search_detailed(db_ref, query_vector, k, opts)
+      when is_reference(db_ref) and is_list(query_vector) and is_integer(k) and k >= 0 do
+    %{filter: filter, ef_search: ef_search} =
+      validate_search_opts!(opts, [:filter, :ef_search])
+
+    Native.search_detailed(db_ref, query_vector, filter, k, ef_search)
+  end
+
+  def search_detailed(_db_ref, _query_vector, k, _opts) do
+    raise ArgumentError,
+          "Invalid arguments to RuvectorElixir.search_detailed/4: expected db_ref, list vector, and non-negative integer k, got k=#{inspect(k)}"
   end
 
   @doc """
-  Searches the database returning detailed search results, raising `ArgumentError` on failure.
+  Searches the database returning detailed search results, raising `RuvectorElixir.Error` on
+  operational failure or `ArgumentError` on invalid arguments.
   """
   @spec search_detailed!(
           db_ref(),
           vector(),
-          map() | keyword() | nil,
-          pos_integer(),
-          pos_integer() | nil
-        ) :: [search_result()]
-  def search_detailed!(db_ref, query_vector, filter \\ nil, k, ef_search \\ nil) do
-    case search_detailed(db_ref, query_vector, filter, k, ef_search) do
+          non_neg_integer(),
+          [search_detailed_option()] | map()
+        ) ::
+          [search_result()]
+  def search_detailed!(db_ref, query_vector, k, opts \\ []) do
+    case search_detailed(db_ref, query_vector, k, opts) do
       {:ok, results} -> results
-      {:error, reason} -> raise ArgumentError, reason
+      {:error, reason} -> raise Error, reason
     end
   end
 
@@ -458,75 +448,326 @@ defmodule RuvectorElixir do
   @doc """
   Calculates the distance between two vectors `a` and `b` using the specified `metric`.
 
-  Supported metrics: `:cosine`, `:euclidean`, `:dot_product`, `:manhattan`.
+  Supported metrics: `:cosine`, `:euclidean`, `:dot_product`, `:dot`, `:manhattan`.
+  Defaults to `:cosine`.
 
   Returns `{:ok, distance}` on success, or `{:error, reason}` on failure (e.g. dimension mismatch).
   """
-  @spec calculate_distance(vector(), vector(), metric()) ::
-          {:ok, float()} | {:error, String.t()}
-  def calculate_distance(_a, _b, _metric), do: :erlang.nif_error(:nif_not_loaded)
-
-  @doc """
-  Convenience helper for `calculate_distance/3`, defaulting to `:cosine`.
-  """
   @spec distance(vector(), vector(), metric()) :: {:ok, float()} | {:error, String.t()}
-  def distance(a, b, metric \\ :cosine), do: calculate_distance(a, b, metric)
+  def distance(a, b, metric \\ :cosine)
+
+  def distance(a, b, metric) when is_list(a) and is_list(b) do
+    validated_metric = validate_metric!(metric)
+    Native.calculate_distance(a, b, validated_metric)
+  end
+
+  def distance(_a, _b, _metric) do
+    raise ArgumentError, "RuvectorElixir.distance/3 expects two lists of numbers"
+  end
 
   @doc """
-  Calculates distance between two vectors, raising `ArgumentError` on failure.
+  Calculates distance between two vectors, raising `RuvectorElixir.Error` on operational failure
+  (e.g. dimension mismatch) or `ArgumentError` on invalid inputs.
   """
   @spec distance!(vector(), vector(), metric()) :: float()
   def distance!(a, b, metric \\ :cosine) do
     case distance(a, b, metric) do
       {:ok, dist} -> dist
-      {:error, reason} -> raise ArgumentError, reason
+      {:error, reason} -> raise Error, reason
     end
   end
 
   @doc """
-  Gets database metadata info including `:dimensions`, `:node_count`, `:distance_metric`, `:storage_path`, and `:hnsw`.
+  Gets database metadata info including `:dimensions`, `:node_count`, `:distance_metric`,
+  `:storage_path`, `:hnsw`, and `:quantization`.
   """
-  @spec info(db_ref()) :: map()
-  def info(_db_ref), do: :erlang.nif_error(:nif_not_loaded)
+  @spec info(db_ref()) :: {:ok, db_info()} | {:error, :closed | String.t()}
+  def info(db_ref) when is_reference(db_ref), do: Native.info(db_ref)
 
-  # ============================================================================
-  # Helpers
-  # ============================================================================
-
-  defp normalize_options(opts) when is_list(opts) do
-    opts
-    |> Map.new()
-    |> normalize_options()
+  @doc """
+  Gets database metadata info, raising `RuvectorElixir.Error` on failure.
+  """
+  @spec info!(db_ref()) :: db_info()
+  def info!(db_ref) do
+    case info(db_ref) do
+      {:ok, info_map} -> info_map
+      {:error, reason} -> raise Error, reason
+    end
   end
 
-  defp normalize_options(%{} = map) do
+  # ============================================================================
+  # Option & Argument Validation Helpers
+  # ============================================================================
+
+  defp normalize_options!(opts, dimensions) when is_list(opts) do
+    if not Keyword.keyword?(opts) do
+      raise ArgumentError, "Database options must be a keyword list or plain map"
+    end
+
+    opts
+    |> Map.new()
+    |> normalize_options!(dimensions)
+  end
+
+  defp normalize_options!(%{} = map, dimensions) when not is_struct(map) do
     Enum.reduce(map, %{}, fn {k, v}, acc ->
-      key = if is_atom(k), do: Atom.to_string(k), else: to_string(k)
+      key = normalize_opt_key!(k)
+
+      if Map.has_key?(acc, key) do
+        raise ArgumentError, "Duplicate database option: #{inspect(key)}"
+      end
+
+      if key in ["metric", "distance_metric"] and
+           (Map.has_key?(acc, "metric") or Map.has_key?(acc, "distance_metric")) do
+        raise ArgumentError, "Cannot specify both :metric and :distance_metric"
+      end
 
       val =
-        case {key, v} do
-          {"hnsw", hnsw_opts} when is_list(hnsw_opts) ->
-            Map.new(hnsw_opts, fn {hk, hv} ->
-              {if(is_atom(hk), do: Atom.to_string(hk), else: to_string(hk)), hv}
-            end)
+        case key do
+          "metric" ->
+            validate_metric!(v)
 
-          {"hnsw", %{} = hnsw_map} ->
-            Map.new(hnsw_map, fn {hk, hv} ->
-              {if(is_atom(hk), do: Atom.to_string(hk), else: to_string(hk)), hv}
-            end)
+          "distance_metric" ->
+            validate_metric!(v)
 
-          {"quantization", q_opts} when is_list(q_opts) ->
-            Map.new(q_opts, fn {qk, qv} ->
-              {if(is_atom(qk), do: Atom.to_string(qk), else: to_string(qk)), qv}
-            end)
+          "hnsw" ->
+            normalize_hnsw!(v)
+
+          "quantization" ->
+            normalize_quantization!(v, dimensions)
 
           _ ->
-            v
+            raise ArgumentError, "Unknown database option: #{inspect(k)}"
         end
 
       Map.put(acc, key, val)
     end)
   end
 
-  defp normalize_options(_), do: %{}
+  defp normalize_options!(other, _dimensions) do
+    raise ArgumentError,
+          "Database options must be a keyword list or plain map, got: #{inspect(other)}"
+  end
+
+  defp normalize_opt_key!(k) when is_boolean(k) or is_nil(k) do
+    raise ArgumentError, "Invalid option key: #{inspect(k)}"
+  end
+
+  defp normalize_opt_key!(k) when is_atom(k), do: Atom.to_string(k)
+  defp normalize_opt_key!(k) when is_binary(k), do: k
+
+  defp normalize_opt_key!(k) do
+    raise ArgumentError, "Invalid option key: #{inspect(k)}"
+  end
+
+  defp validate_metric!(metric) when metric in @valid_metrics, do: metric
+
+  defp validate_metric!(metric) when is_binary(metric) do
+    if String.downcase(metric) in @valid_metric_strings do
+      metric
+    else
+      raise ArgumentError, "Unsupported distance metric: #{inspect(metric)}"
+    end
+  end
+
+  defp validate_metric!(other) do
+    raise ArgumentError, "Unsupported distance metric: #{inspect(other)}"
+  end
+
+  defp normalize_hnsw!(nil), do: nil
+  defp normalize_hnsw!(b) when is_boolean(b), do: b
+
+  defp normalize_hnsw!(opts) when is_list(opts) do
+    if not Keyword.keyword?(opts) do
+      raise ArgumentError, ":hnsw options must be a keyword list, plain map, or boolean"
+    end
+
+    opts |> Map.new() |> normalize_hnsw!()
+  end
+
+  defp normalize_hnsw!(%{} = map) when not is_struct(map) do
+    Enum.reduce(map, %{}, fn {hk, hv}, acc ->
+      hkey = normalize_opt_key!(hk)
+
+      if Map.has_key?(acc, hkey) do
+        raise ArgumentError, "Duplicate :hnsw option: #{inspect(hkey)}"
+      end
+
+      if hkey not in ["m", "ef_construction", "ef_search", "max_elements"] do
+        raise ArgumentError, "Unknown :hnsw option: #{inspect(hk)}"
+      end
+
+      if not (is_integer(hv) and hv > 0) do
+        raise ArgumentError,
+              ":hnsw option :#{hkey} must be a positive integer, got: #{inspect(hv)}"
+      end
+
+      if hkey == "m" and hv not in 2..256 do
+        raise ArgumentError, ":hnsw option :m must be between 2 and 256, got: #{inspect(hv)}"
+      end
+
+      Map.put(acc, hkey, hv)
+    end)
+  end
+
+  defp normalize_hnsw!(other) do
+    raise ArgumentError,
+          ":hnsw must be a boolean, keyword list, or plain map, got: #{inspect(other)}"
+  end
+
+  defp normalize_quantization!(nil, _dimensions), do: nil
+
+  defp normalize_quantization!(q, _dimensions) when q in [:scalar, :binary, :none], do: q
+
+  defp normalize_quantization!(q, _dimensions) when is_binary(q) do
+    if String.downcase(q) in ["scalar", "binary", "none"] do
+      q
+    else
+      raise ArgumentError, "Unsupported :quantization option: #{inspect(q)}"
+    end
+  end
+
+  defp normalize_quantization!(opts, dimensions) when is_list(opts) do
+    if not Keyword.keyword?(opts) do
+      raise ArgumentError,
+            ":quantization options must be a keyword list, plain map, or atom/string"
+    end
+
+    opts |> Map.new() |> normalize_quantization!(dimensions)
+  end
+
+  defp normalize_quantization!(%{} = map, dimensions) when not is_struct(map) do
+    if map_size(map) == 0 do
+      raise ArgumentError, ":quantization option map cannot be empty"
+    end
+
+    normalized =
+      Enum.reduce(map, %{}, fn {qk, qv}, acc ->
+        qkey = normalize_opt_key!(qk)
+
+        if Map.has_key?(acc, qkey) do
+          raise ArgumentError, "Duplicate :quantization option: #{inspect(qkey)}"
+        end
+
+        val =
+          case qkey do
+            "type" ->
+              validate_quantization_type!(qv)
+
+            param when param in ["subspaces", "k"] ->
+              if not (is_integer(qv) and qv > 0) do
+                raise ArgumentError,
+                      ":quantization :#{param} must be a positive integer, got: #{inspect(qv)}"
+              end
+
+              qv
+
+            _ ->
+              raise ArgumentError, "Unknown :quantization option: #{inspect(qk)}"
+          end
+
+        Map.put(acc, qkey, val)
+      end)
+
+    type_val = Map.get(normalized, "type")
+    has_product_params = Map.has_key?(normalized, "subspaces") or Map.has_key?(normalized, "k")
+
+    if type_val in [:scalar, :binary, :none, "scalar", "binary", "none"] and has_product_params do
+      raise ArgumentError,
+            ":subspaces and :k are only valid with :product quantization, not #{inspect(type_val)}"
+    end
+
+    is_product =
+      type_val in [:product, "product"] or
+        (is_binary(type_val) and String.downcase(type_val) == "product") or
+        (is_nil(type_val) and has_product_params)
+
+    if is_product do
+      subspaces = Map.get(normalized, "subspaces", 8)
+
+      if rem(dimensions, subspaces) != 0 do
+        raise ArgumentError,
+              ":quantization :subspaces (#{subspaces}) must evenly divide dimensions (#{dimensions})"
+      end
+    end
+
+    normalized
+  end
+
+  defp normalize_quantization!(other, _dimensions) do
+    raise ArgumentError, "Unsupported :quantization option: #{inspect(other)}"
+  end
+
+  defp validate_quantization_type!(t) when t in [:scalar, :binary, :none, :product], do: t
+
+  defp validate_quantization_type!(t) when is_binary(t) do
+    if String.downcase(t) in ["scalar", "binary", "none", "product"] do
+      t
+    else
+      raise ArgumentError, "Unsupported :quantization :type: #{inspect(t)}"
+    end
+  end
+
+  defp validate_quantization_type!(other) do
+    raise ArgumentError, "Unsupported :quantization :type: #{inspect(other)}"
+  end
+
+  defp validate_search_opts!(opts, allowed_keys) when is_list(opts) do
+    if not Keyword.keyword?(opts) do
+      raise ArgumentError, "Search options must be a keyword list or plain map"
+    end
+
+    validate_search_opts!(Map.new(opts), allowed_keys)
+  end
+
+  defp validate_search_opts!(%{} = opts, allowed_keys) when not is_struct(opts) do
+    Enum.each(opts, fn {k, _v} ->
+      if k not in allowed_keys do
+        raise ArgumentError,
+              "Unknown search option #{inspect(k)}; allowed options: #{inspect(allowed_keys)}"
+      end
+    end)
+
+    filter = Map.get(opts, :filter)
+    validate_filter!(filter)
+
+    ef_search = Map.get(opts, :ef_search)
+
+    if :ef_search in allowed_keys and ef_search != nil and
+         not (is_integer(ef_search) and ef_search > 0) do
+      raise ArgumentError,
+            ":ef_search must be a positive integer or nil, got: #{inspect(ef_search)}"
+    end
+
+    %{filter: filter, ef_search: ef_search}
+  end
+
+  defp validate_search_opts!(other, _allowed_keys) do
+    raise ArgumentError,
+          "Search options must be a keyword list or plain map, got: #{inspect(other)}"
+  end
+
+  defp validate_filter!(nil), do: :ok
+  defp validate_filter!(%{} = filter) when not is_struct(filter), do: :ok
+
+  defp validate_filter!(filter) when is_list(filter) do
+    if Keyword.keyword?(filter) or
+         Enum.all?(filter, fn
+           {k, _v} when is_binary(k) or (is_atom(k) and not is_boolean(k) and not is_nil(k)) ->
+             true
+
+           _ ->
+             false
+         end) do
+      :ok
+    else
+      raise ArgumentError,
+            ":filter list must be a keyword list or list of {string_or_atom, value} pairs, got: #{inspect(filter)}"
+    end
+  end
+
+  defp validate_filter!(other) do
+    raise ArgumentError,
+          ":filter must be a plain map, keyword list, or nil, got: #{inspect(other)}"
+  end
 end

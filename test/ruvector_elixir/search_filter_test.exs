@@ -1,15 +1,14 @@
 defmodule RuvectorElixir.SearchFilterTest do
   use ExUnit.Case, async: true
 
-  setup do
-    db_path =
-      Path.join(System.tmp_dir!(), "ruvector_filter_#{System.unique_integer([:positive])}.rvf")
+  alias RuvectorElixir.Error
 
-    on_exit(fn -> File.rm_rf(db_path) end)
+  @moduletag :tmp_dir
 
+  setup %{tmp_dir: tmp_dir} do
+    db_path = Path.join(tmp_dir, "ruvector_filter.rvf")
     {:ok, db} = RuvectorElixir.open(db_path, 16)
 
-    # Insert 50 vectors with varied metadata
     entries =
       for i <- 0..49 do
         %{
@@ -34,7 +33,7 @@ defmodule RuvectorElixir.SearchFilterTest do
       query = for j <- 0..15, do: j * 0.1
       filter = %{"category" => 0}
 
-      {:ok, results} = RuvectorElixir.search_detailed(db, query, filter, 100)
+      assert {:ok, results} = RuvectorElixir.search_detailed(db, query, 100, filter: filter)
       assert length(results) > 0
 
       for res <- results do
@@ -46,8 +45,7 @@ defmodule RuvectorElixir.SearchFilterTest do
       query = for j <- 0..15, do: j * 0.1
       filter = %{"decade" => 2}
 
-      {:ok, results} = RuvectorElixir.search_detailed(db, query, filter, 100)
-      # decade 2 should correspond to i in 20..29 -> 10 vectors
+      assert {:ok, results} = RuvectorElixir.search_detailed(db, query, 100, filter: filter)
       assert length(results) == 10
 
       for res <- results do
@@ -59,7 +57,7 @@ defmodule RuvectorElixir.SearchFilterTest do
       query = for j <- 0..15, do: j * 0.1
       filter = %{category: 1}
 
-      {:ok, results} = RuvectorElixir.search_detailed(db, query, filter, 50)
+      assert {:ok, results} = RuvectorElixir.search_detailed(db, query, 50, filter: filter)
       assert length(results) > 0
 
       for res <- results do
@@ -71,7 +69,7 @@ defmodule RuvectorElixir.SearchFilterTest do
       query = for j <- 0..15, do: j * 0.1
       filter = %{"active" => true}
 
-      {:ok, results} = RuvectorElixir.search_detailed(db, query, filter, 100)
+      assert {:ok, results} = RuvectorElixir.search_detailed(db, query, 100, filter: filter)
       assert length(results) == 25
 
       for res <- results do
@@ -83,95 +81,106 @@ defmodule RuvectorElixir.SearchFilterTest do
       query = for j <- 0..15, do: j * 0.1
       filter = %{"category" => 999}
 
-      results = RuvectorElixir.search(db, query, filter, 10)
-      assert results == []
-
-      {:ok, detailed} = RuvectorElixir.search_detailed(db, query, filter, 10)
-      assert detailed == []
+      assert {:ok, []} = RuvectorElixir.search(db, query, 10, filter: filter)
+      assert {:ok, []} = RuvectorElixir.search_detailed(db, query, 10, filter: filter)
     end
 
     test "nil or empty filter returns unfiltered results", %{db: db} do
       query = for j <- 0..15, do: j * 0.1
 
-      all_results = RuvectorElixir.search(db, query, 10)
+      assert {:ok, all_results} = RuvectorElixir.search(db, query, 10)
       assert length(all_results) == 10
 
-      with_nil = RuvectorElixir.search(db, query, nil, 10)
-      assert with_nil == all_results
-
-      with_empty_map = RuvectorElixir.search(db, query, %{}, 10)
-      assert with_empty_map == all_results
+      assert {:ok, ^all_results} = RuvectorElixir.search(db, query, 10, filter: nil)
+      assert {:ok, ^all_results} = RuvectorElixir.search(db, query, 10, filter: %{})
     end
 
     test "k larger than total elements returns all available elements", %{db: db} do
       query = for j <- 0..15, do: j * 0.1
-      results = RuvectorElixir.search(db, query, 500)
+      assert {:ok, results} = RuvectorElixir.search(db, query, 500)
       assert length(results) == 50
     end
 
     test "search with k = 1 returns exactly the single closest element", %{db: db} do
       query = for j <- 0..15, do: j * 0.1
-      results = RuvectorElixir.search(db, query, 1)
-      assert length(results) == 1
-      assert hd(results) == "vec_0"
+      assert {:ok, ["vec_0"]} = RuvectorElixir.search(db, query, 1)
     end
 
-    test "empty filter %{} does not drop vectors with nil metadata" do
-      nil_db_path =
-        Path.join(
-          System.tmp_dir!(),
-          "ruvector_nil_meta_#{System.unique_integer([:positive])}.rvf"
-        )
+    @tag :tmp_dir
+    test "empty filter %{} does not drop vectors with nil metadata", %{tmp_dir: tmp_dir} do
+      nil_db_path = Path.join(tmp_dir, "ruvector_nil_meta.rvf")
 
-      on_exit(fn -> File.rm_rf(nil_db_path) end)
+      assert {:ok, db} = RuvectorElixir.open(nil_db_path, 3)
 
-      {:ok, db} = RuvectorElixir.open(nil_db_path, 3)
-      {:ok, "v_no_meta"} = RuvectorElixir.insert(db, %{id: "v_no_meta", vector: [1.0, 2.0, 3.0]})
+      assert {:ok, "v_no_meta"} =
+               RuvectorElixir.insert(db, %{id: "v_no_meta", vector: [1.0, 2.0, 3.0]})
 
-      # Searching with %{} must find the vector, not drop it!
-      assert RuvectorElixir.search(db, [1.0, 2.0, 3.0], %{}, 5) == ["v_no_meta"]
-      assert {:ok, [res]} = RuvectorElixir.search_detailed(db, [1.0, 2.0, 3.0], %{}, 5)
+      assert {:ok, ["v_no_meta"]} = RuvectorElixir.search(db, [1.0, 2.0, 3.0], 5, filter: %{})
+
+      assert {:ok, [res]} =
+               RuvectorElixir.search_detailed(db, [1.0, 2.0, 3.0], 5, filter: %{})
+
       assert res.id == "v_no_meta"
     end
 
-    test "filter with keyword list [category: 0] is supported", %{db: db} do
+    test "filter with keyword list [category: 0] and first-key-wins semantics", %{db: db} do
       query = for j <- 0..15, do: j * 0.1
-      results = RuvectorElixir.search(db, query, [category: 0], 10)
+
+      assert {:ok, results} = RuvectorElixir.search(db, query, 10, filter: [category: 0])
       assert length(results) > 0
 
-      {:ok, detailed} = RuvectorElixir.search_detailed(db, query, [category: 0], 10)
+      assert {:ok, detailed} =
+               RuvectorElixir.search_detailed(db, query, 10, filter: [category: 0])
 
       for r <- detailed do
         assert r.metadata["category"] == 0
       end
+
+      assert {:ok, dup_results} =
+               RuvectorElixir.search_detailed(db, query, 10, filter: [category: 1, category: 2])
+
+      assert length(dup_results) > 0
+
+      for r <- dup_results do
+        assert r.metadata["category"] == 1
+      end
     end
 
-    test "search! and search_detailed! return direct results and raise on error", %{db: db} do
+    test "numeric equality between integer and float metadata values", %{db: db} do
+      assert {:ok, "float_ver"} =
+               RuvectorElixir.insert(db, %{
+                 id: "float_ver",
+                 vector: List.duplicate(0.0, 16),
+                 metadata: %{"version" => 1.0}
+               })
+
+      assert {:ok, ["float_ver"]} =
+               RuvectorElixir.search(db, List.duplicate(0.0, 16), 5, filter: %{"version" => 1})
+    end
+
+    test "search! and search_detailed! return direct results and raise RuvectorElixir.Error on operational error",
+         %{db: db} do
       query = for j <- 0..15, do: j * 0.1
       results = RuvectorElixir.search!(db, query, 5)
       assert length(results) == 5
 
-      detailed = RuvectorElixir.search_detailed!(db, query, [category: 1], 5)
+      detailed = RuvectorElixir.search_detailed!(db, query, 5, filter: [category: 1])
       assert length(detailed) > 0
 
-      # Dimension mismatch raises ArgumentError
-      assert_raise ArgumentError, fn ->
+      assert_raise Error, fn ->
         RuvectorElixir.search!(db, [1.0, 2.0], 5)
       end
 
-      assert_raise ArgumentError, fn ->
+      assert_raise Error, fn ->
         RuvectorElixir.search_detailed!(db, [1.0, 2.0], 5)
       end
     end
   end
 
   describe "scale and batch stress tests" do
-    test "insert and search 500 vectors" do
-      db_path =
-        Path.join(System.tmp_dir!(), "ruvector_scale_#{System.unique_integer([:positive])}.rvf")
-
-      on_exit(fn -> File.rm_rf(db_path) end)
-
+    @tag :tmp_dir
+    test "insert and search 500 vectors", %{tmp_dir: tmp_dir} do
+      db_path = Path.join(tmp_dir, "ruvector_scale.rvf")
       {:ok, db} = RuvectorElixir.open(db_path, 32)
 
       batch =
@@ -188,8 +197,8 @@ defmodule RuvectorElixir.SearchFilterTest do
       assert {:ok, 500} = RuvectorElixir.len(db)
 
       query = for j <- 0..31, do: j * 0.001
-      results = RuvectorElixir.search(db, query, %{"group" => 0}, 100)
-      assert length(results) == 20
+      assert {:ok, results} = RuvectorElixir.search(db, query, 100, filter: %{"group" => 0})
+      assert length(results) == 100
       assert hd(results) == "s_0"
     end
   end

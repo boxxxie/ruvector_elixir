@@ -1,47 +1,42 @@
 defmodule RuvectorElixirTest do
   use ExUnit.Case, async: true
 
-  setup do
-    db_path =
-      Path.join(System.tmp_dir!(), "ruvector_test_#{System.unique_integer([:positive])}.db")
+  doctest RuvectorElixir.VectorEntry
 
-    on_exit(fn ->
-      File.rm_rf!(db_path)
-    end)
+  @tag :tmp_dir
+  test "can open a database and search", %{tmp_dir: tmp_dir} do
+    db_path = Path.join(tmp_dir, "ruvector_test.rvf")
+    assert {:ok, db_ref} = RuvectorElixir.open(db_path, 768)
+    assert is_reference(db_ref)
 
-    {:ok, db_path: db_path}
-  end
-
-  test "can open a database and fail/succeed accordingly", %{db_path: db_path} do
-    assert {:ok, db_ref} = RuvectorElixir.open_db(db_path, 768)
-
-    assert is_reference(db_ref) or is_struct(db_ref) or
-             (is_map(db_ref) and Map.has_key?(db_ref, :__struct__))
-
-    # We should be able to search on the open database
-    # A vector of 768 dimensions (since we hardcoded 768 for gemini-embedding-2)
     query_vector = List.duplicate(0.1, 768)
-    results = RuvectorElixir.search(db_ref, query_vector, 5)
-    assert is_list(results)
+    assert {:ok, []} = RuvectorElixir.search(db_ref, query_vector, 5)
   end
 
-  test "search/4 accepts filter and works on empty DB", %{db_path: db_path} do
-    assert {:ok, db_ref} = RuvectorElixir.open_db(db_path, 768)
+  @tag :tmp_dir
+  test "search/4 accepts filter and works on empty DB", %{tmp_dir: tmp_dir} do
+    db_path = Path.join(tmp_dir, "ruvector_filter_empty.rvf")
+    assert {:ok, db_ref} = RuvectorElixir.open(db_path, 768)
     query_vector = List.duplicate(0.1, 768)
 
-    results =
-      RuvectorElixir.search(db_ref, query_vector, %{"schemaCleanName" => "diligence_analysis"}, 5)
-
-    assert results == []
+    assert {:ok, []} =
+             RuvectorElixir.search(db_ref, query_vector, 5,
+               filter: %{"schemaCleanName" => "diligence_analysis"}
+             )
   end
 
-  test "info/1 returns database metadata", %{db_path: db_path} do
-    assert {:ok, db_ref} = RuvectorElixir.open_db(db_path, 768)
-    info = RuvectorElixir.info(db_ref)
+  @tag :tmp_dir
+  test "info/1 returns database metadata with atom keys", %{tmp_dir: tmp_dir} do
+    db_path = Path.join(tmp_dir, "ruvector_info.rvf")
+    assert {:ok, db_ref} = RuvectorElixir.open(db_path, 768)
+    assert {:ok, info} = RuvectorElixir.info(db_ref)
 
     assert is_map(info)
-    assert info["dimensions"] == 768
-    assert info["node_count"] == 0
-    assert info["distance_metric"] == "cosine"
+    assert info.dimensions == 768
+    assert info.node_count == 0
+    assert info.distance_metric == :cosine
+    assert info.storage_path == db_path
+    assert info.hnsw == nil
+    assert info.quantization == nil
   end
 end
