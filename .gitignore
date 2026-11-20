@@ -44,4 +44,4 @@ ruvector_elixir-*.tar
 Thumbs.db
 
 # Local ruvector databases
-/*.rvf
+*.rvf
