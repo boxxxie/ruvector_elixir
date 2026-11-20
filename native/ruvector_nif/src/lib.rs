@@ -12,30 +12,74 @@ use std::sync::RwLock;
 
 const MAX_JSON_DEPTH: usize = 128;
 
-enum DbBackend {
-    Persistent(VectorDB),
-    InMemory(InMemoryDB),
+enum MemoryIndex {
+    Flat(FlatIndex),
+    Hnsw(HnswIndex),
+}
+
+impl MemoryIndex {
+    fn add(&mut self, id: String, vector: Vec<f32>) -> Result<(), String> {
+        match self {
+            MemoryIndex::Flat(idx) => idx.add(id, vector).map_err(|e| e.to_string()),
+            MemoryIndex::Hnsw(idx) => idx.add(id, vector).map_err(|e| e.to_string()),
+        }
+    }
+
+    fn add_batch(&mut self, entries: Vec<(String, Vec<f32>)>) -> Result<(), String> {
+        match self {
+            MemoryIndex::Flat(idx) => idx.add_batch(entries).map_err(|e| e.to_string()),
+            MemoryIndex::Hnsw(idx) => idx.add_batch(entries).map_err(|e| e.to_string()),
+        }
+    }
+
+    fn remove(&mut self, id: &String) -> Result<bool, String> {
+        match self {
+            MemoryIndex::Flat(idx) => idx.remove(id).map_err(|e| e.to_string()),
+            MemoryIndex::Hnsw(idx) => idx.remove(id).map_err(|e| e.to_string()),
+        }
+    }
+
+    fn search(
+        &self,
+        query: &[f32],
+        k: usize,
+        ef_search: Option<usize>,
+    ) -> Result<Vec<SearchResult>, String> {
+        match self {
+            MemoryIndex::Flat(idx) => idx.search(query, k).map_err(|e| e.to_string()),
+            MemoryIndex::Hnsw(idx) => match ef_search {
+                Some(ef) => idx.search_with_ef(query, k, ef).map_err(|e| e.to_string()),
+                None => idx.search(query, k).map_err(|e| e.to_string()),
+            },
+        }
+    }
+}
+
+struct InMemoryState {
+    entries: HashMap<String, VectorEntry>,
+    index: MemoryIndex,
 }
 
 struct InMemoryDB {
-    entries: RwLock<HashMap<String, VectorEntry>>,
-    index: RwLock<Box<dyn VectorIndex>>,
+    state: RwLock<InMemoryState>,
     options: DbOptions,
 }
 
 impl InMemoryDB {
     fn new(options: DbOptions) -> Result<Self, String> {
-        let index: Box<dyn VectorIndex> = match &options.hnsw_config {
-            Some(cfg) => Box::new(
+        let index = match &options.hnsw_config {
+            Some(cfg) => MemoryIndex::Hnsw(
                 HnswIndex::new(options.dimensions, options.distance_metric, cfg.clone())
                     .map_err(|e| e.to_string())?,
             ),
-            None => Box::new(FlatIndex::new(options.dimensions, options.distance_metric)),
+            None => MemoryIndex::Flat(FlatIndex::new(options.dimensions, options.distance_metric)),
         };
 
         Ok(Self {
-            entries: RwLock::new(HashMap::new()),
-            index: RwLock::new(index),
+            state: RwLock::new(InMemoryState {
+                entries: HashMap::new(),
+                index,
+            }),
             options,
         })
     }
@@ -54,24 +98,19 @@ impl InMemoryDB {
             .take()
             .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
         entry.id = Some(id.clone());
-
         let vec_for_index = entry.vector.clone();
 
-        {
-            let mut entries = self
-                .entries
-                .write()
-                .map_err(|_| "In-memory entries lock poisoned".to_string())?;
-            entries.insert(id.clone(), entry);
+        let mut state = self
+            .state
+            .write()
+            .map_err(|_| "In-memory database lock poisoned".to_string())?;
+
+        if state.entries.contains_key(&id) {
+            let _ = state.index.remove(&id)?;
         }
 
-        let mut index = self
-            .index
-            .write()
-            .map_err(|_| "In-memory index lock poisoned".to_string())?;
-        index
-            .add(id.clone(), vec_for_index)
-            .map_err(|e| e.to_string())?;
+        state.index.add(id.clone(), vec_for_index)?;
+        state.entries.insert(id.clone(), entry);
 
         Ok(id)
     }
@@ -87,126 +126,186 @@ impl InMemoryDB {
             }
         }
 
+        let mut prepared = Vec::with_capacity(entries_in.len());
         let mut ids = Vec::with_capacity(entries_in.len());
         let mut index_entries = Vec::with_capacity(entries_in.len());
 
-        {
-            let mut entries = self
-                .entries
-                .write()
-                .map_err(|_| "In-memory entries lock poisoned".to_string())?;
+        for mut entry in entries_in {
+            let id = entry
+                .id
+                .take()
+                .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+            entry.id = Some(id.clone());
+            index_entries.push((id.clone(), entry.vector.clone()));
+            ids.push(id.clone());
+            prepared.push((id, entry));
+        }
 
-            for mut entry in entries_in {
-                let id = entry
-                    .id
-                    .take()
-                    .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
-                entry.id = Some(id.clone());
-                index_entries.push((id.clone(), entry.vector.clone()));
-                entries.insert(id.clone(), entry);
-                ids.push(id);
+        let mut state = self
+            .state
+            .write()
+            .map_err(|_| "In-memory database lock poisoned".to_string())?;
+
+        for (id, _) in &prepared {
+            if state.entries.contains_key(id) {
+                let _ = state.index.remove(id)?;
             }
         }
 
-        let mut index = self
-            .index
-            .write()
-            .map_err(|_| "In-memory index lock poisoned".to_string())?;
-        index.add_batch(index_entries).map_err(|e| e.to_string())?;
+        state.index.add_batch(index_entries)?;
+        for (id, entry) in prepared {
+            state.entries.insert(id, entry);
+        }
 
         Ok(ids)
     }
 
     fn get(&self, id: &str) -> Result<Option<VectorEntry>, String> {
-        let entries = self
-            .entries
+        let state = self
+            .state
             .read()
-            .map_err(|_| "In-memory entries lock poisoned".to_string())?;
-        Ok(entries.get(id).cloned())
+            .map_err(|_| "In-memory database lock poisoned".to_string())?;
+        Ok(state.entries.get(id).cloned())
     }
 
     fn delete(&self, id: &str) -> Result<bool, String> {
-        let removed = {
-            let mut entries = self
-                .entries
-                .write()
-                .map_err(|_| "In-memory entries lock poisoned".to_string())?;
-            entries.remove(id).is_some()
-        };
+        let mut state = self
+            .state
+            .write()
+            .map_err(|_| "In-memory database lock poisoned".to_string())?;
 
+        let removed = state.entries.remove(id).is_some();
         if removed {
-            let mut index = self
-                .index
-                .write()
-                .map_err(|_| "In-memory index lock poisoned".to_string())?;
-            let _ = index.remove(&id.to_string()).map_err(|e| e.to_string())?;
+            let _ = state.index.remove(&id.to_string())?;
         }
-
         Ok(removed)
     }
 
     fn len(&self) -> Result<usize, String> {
-        let entries = self
-            .entries
+        let state = self
+            .state
             .read()
-            .map_err(|_| "In-memory entries lock poisoned".to_string())?;
-        Ok(entries.len())
+            .map_err(|_| "In-memory database lock poisoned".to_string())?;
+        Ok(state.entries.len())
     }
 
     fn is_empty(&self) -> Result<bool, String> {
-        let entries = self
-            .entries
+        let state = self
+            .state
             .read()
-            .map_err(|_| "In-memory entries lock poisoned".to_string())?;
-        Ok(entries.is_empty())
+            .map_err(|_| "In-memory database lock poisoned".to_string())?;
+        Ok(state.entries.is_empty())
     }
 
     fn keys(&self) -> Result<Vec<String>, String> {
-        let entries = self
-            .entries
+        let state = self
+            .state
             .read()
-            .map_err(|_| "In-memory entries lock poisoned".to_string())?;
-        Ok(entries.keys().cloned().collect())
+            .map_err(|_| "In-memory database lock poisoned".to_string())?;
+        Ok(state.entries.keys().cloned().collect())
     }
 
-    fn search_unfiltered(&self, query_vec: &[f32], k: usize) -> Result<Vec<SearchResult>, String> {
-        if query_vec.len() != self.options.dimensions {
+    fn search(&self, query: &SearchQuery, hydrate: bool) -> Result<Vec<SearchResult>, String> {
+        if query.vector.len() != self.options.dimensions {
             return Err(format!(
                 "Dimension mismatch: expected {}, actual {}",
                 self.options.dimensions,
-                query_vec.len()
+                query.vector.len()
             ));
         }
 
-        if k == 0 {
+        if query.k == 0 {
             return Ok(Vec::new());
         }
 
-        let mut results = {
-            let index = self
-                .index
-                .read()
-                .map_err(|_| "In-memory index lock poisoned".to_string())?;
-            index.search(query_vec, k).map_err(|e| e.to_string())?
-        };
-
-        let entries = self
-            .entries
+        let state = self
+            .state
             .read()
-            .map_err(|_| "In-memory entries lock poisoned".to_string())?;
-        for result in &mut results {
-            if let Some(entry) = entries.get(&result.id) {
-                result.vector = Some(entry.vector.clone());
-                result.metadata = entry.metadata.clone();
-            }
+            .map_err(|_| "In-memory database lock poisoned".to_string())?;
+
+        let total = state.entries.len();
+        if total == 0 {
+            return Ok(Vec::new());
         }
 
-        Ok(results)
+        let hydrate_results = |candidates: Vec<SearchResult>| -> Vec<SearchResult> {
+            candidates
+                .into_iter()
+                .map(|mut r| {
+                    if hydrate {
+                        if let Some(entry) = state.entries.get(&r.id) {
+                            r.vector = Some(entry.vector.clone());
+                            r.metadata = entry.metadata.clone();
+                        }
+                    }
+                    r
+                })
+                .collect()
+        };
+
+        let Some(filter) = &query.filter else {
+            let mut results = state
+                .index
+                .search(&query.vector, query.k, query.ef_search)?;
+            if results.len() < query.k
+                && self.options.hnsw_config.is_some()
+                && total > results.len()
+            {
+                let mut fetch_k = query.k.saturating_mul(4).max(64).min(total);
+                loop {
+                    let mut widened =
+                        state
+                            .index
+                            .search(&query.vector, fetch_k, query.ef_search)?;
+                    if widened.len() >= query.k || fetch_k >= total {
+                        widened.truncate(query.k);
+                        results = widened;
+                        break;
+                    }
+                    fetch_k = next_fetch_k(fetch_k, total);
+                }
+            }
+            return Ok(hydrate_results(results));
+        };
+
+        let mut fetch_k = query.k.saturating_mul(4).max(64).min(total);
+        loop {
+            let candidates = state
+                .index
+                .search(&query.vector, fetch_k, query.ef_search)?;
+            let mut matched: Vec<SearchResult> = candidates
+                .into_iter()
+                .filter(|r| {
+                    let meta = state.entries.get(&r.id).and_then(|e| e.metadata.as_ref());
+                    matches_filter(meta, filter)
+                })
+                .collect();
+
+            if matched.len() >= query.k || fetch_k >= total {
+                matched.truncate(query.k);
+                return Ok(hydrate_results(matched));
+            }
+
+            fetch_k = next_fetch_k(fetch_k, total);
+        }
     }
 
     fn options(&self) -> &DbOptions {
         &self.options
     }
+}
+
+fn next_fetch_k(current: usize, total: usize) -> usize {
+    if current >= total / 4 {
+        total
+    } else {
+        current.saturating_mul(2).min(total)
+    }
+}
+
+enum DbBackend {
+    Persistent(VectorDB),
+    InMemory(InMemoryDB),
 }
 
 impl DbBackend {
@@ -259,94 +358,73 @@ impl DbBackend {
         }
     }
 
-    fn search_unfiltered(
-        &self,
-        vector: &[f32],
-        k: usize,
-        ef_search: Option<usize>,
-    ) -> Result<Vec<SearchResult>, String> {
-        let expected_dim = self.options().dimensions;
-        if vector.len() != expected_dim {
-            return Err(format!(
-                "Dimension mismatch: expected {}, actual {}",
-                expected_dim,
-                vector.len()
-            ));
-        }
-
-        if k == 0 {
-            return Ok(Vec::new());
-        }
-
+    fn search(&self, query: SearchQuery, hydrate: bool) -> Result<Vec<SearchResult>, String> {
         match self {
-            DbBackend::Persistent(db) => db
-                .search(SearchQuery {
-                    vector: vector.to_vec(),
-                    k,
-                    filter: None,
-                    ef_search,
-                })
-                .map_err(|e| e.to_string()),
-            DbBackend::InMemory(db) => db.search_unfiltered(vector, k),
-        }
-    }
+            DbBackend::InMemory(db) => db.search(&query, hydrate),
+            DbBackend::Persistent(db) => {
+                let expected_dim = db.options().dimensions;
+                if query.vector.len() != expected_dim {
+                    return Err(format!(
+                        "Dimension mismatch: expected {}, actual {}",
+                        expected_dim,
+                        query.vector.len()
+                    ));
+                }
 
-    fn search(&self, query: SearchQuery) -> Result<Vec<SearchResult>, String> {
-        let expected_dim = self.options().dimensions;
-        if query.vector.len() != expected_dim {
-            return Err(format!(
-                "Dimension mismatch: expected {}, actual {}",
-                expected_dim,
-                query.vector.len()
-            ));
-        }
+                if query.k == 0 {
+                    return Ok(Vec::new());
+                }
 
-        if query.k == 0 {
-            return Ok(Vec::new());
-        }
+                let run_persistent = |k: usize| -> Result<Vec<SearchResult>, String> {
+                    db.search(SearchQuery {
+                        vector: query.vector.clone(),
+                        k,
+                        filter: None,
+                        ef_search: query.ef_search,
+                    })
+                    .map_err(|e| e.to_string())
+                };
 
-        let Some(filter) = &query.filter else {
-            let results = self.search_unfiltered(&query.vector, query.k, query.ef_search)?;
-            if results.len() < query.k && self.options().hnsw_config.is_some() {
-                let total = self.len()?;
-                if total > results.len() {
-                    let mut fetch_k = query.k.saturating_mul(4).max(64).min(total);
-                    loop {
-                        let mut widened =
-                            self.search_unfiltered(&query.vector, fetch_k, query.ef_search)?;
-                        if widened.len() >= query.k || fetch_k >= total {
-                            widened.truncate(query.k);
-                            return Ok(widened);
+                let Some(filter) = &query.filter else {
+                    let results = run_persistent(query.k)?;
+                    if results.len() < query.k && db.options().hnsw_config.is_some() {
+                        let total = db.len().map_err(|e| e.to_string())?;
+                        if total > results.len() {
+                            let mut fetch_k = query.k.saturating_mul(4).max(64).min(total);
+                            loop {
+                                let mut widened = run_persistent(fetch_k)?;
+                                if widened.len() >= query.k || fetch_k >= total {
+                                    widened.truncate(query.k);
+                                    return Ok(widened);
+                                }
+                                fetch_k = next_fetch_k(fetch_k, total);
+                            }
                         }
-                        fetch_k = fetch_k.saturating_mul(2).min(total);
                     }
+                    return Ok(results);
+                };
+
+                let total = db.len().map_err(|e| e.to_string())?;
+                if total == 0 {
+                    return Ok(Vec::new());
+                }
+
+                let mut fetch_k = query.k.saturating_mul(4).max(64).min(total);
+                loop {
+                    let candidates = run_persistent(fetch_k)?;
+                    let mut matched: Vec<SearchResult> = candidates
+                        .into_iter()
+                        .filter(|r| matches_filter(r.metadata.as_ref(), filter))
+                        .collect();
+
+                    if matched.len() >= query.k || fetch_k >= total {
+                        matched.truncate(query.k);
+                        return Ok(matched);
+                    }
+
+                    fetch_k = next_fetch_k(fetch_k, total);
                 }
             }
-            return Ok(results);
-        };
-
-        let total = self.len()?;
-        if total == 0 {
-            return Ok(Vec::new());
-        }
-
-        // Iteratively over-fetch unfiltered candidates so post-filtering preserves
-        // top-k recall without forcing a full scan when matches are common, while
-        // still reaching full recall up to `total` when matches are sparse.
-        let mut fetch_k = query.k.saturating_mul(4).max(64).min(total);
-        loop {
-            let candidates = self.search_unfiltered(&query.vector, fetch_k, query.ef_search)?;
-            let mut matched: Vec<SearchResult> = candidates
-                .into_iter()
-                .filter(|r| matches_filter(r.metadata.as_ref(), filter))
-                .collect();
-
-            if matched.len() >= query.k || fetch_k >= total {
-                matched.truncate(query.k);
-                return Ok(matched);
-            }
-
-            fetch_k = fetch_k.saturating_mul(2).min(total);
         }
     }
 
@@ -358,16 +436,34 @@ impl DbBackend {
     }
 }
 
+fn json_number_as_i128(n: &serde_json::Number) -> Option<i128> {
+    n.as_i64()
+        .map(i128::from)
+        .or_else(|| n.as_u64().map(i128::from))
+}
+
+fn f64_eq_i128(f: f64, i: i128) -> bool {
+    const I128_MIN_F64: f64 = -170_141_183_460_469_231_731_687_303_715_884_105_728.0;
+    const I128_MAX_BOUND_F64: f64 = 170_141_183_460_469_231_731_687_303_715_884_105_728.0;
+
+    f.is_finite()
+        && f.fract() == 0.0
+        && (I128_MIN_F64..I128_MAX_BOUND_F64).contains(&f)
+        && (f as i128) == i
+        && (i as f64) == f
+}
+
 fn json_values_equal(a: &serde_json::Value, b: &serde_json::Value) -> bool {
     match (a, b) {
         (serde_json::Value::Number(na), serde_json::Value::Number(nb)) => {
-            if na == nb {
-                true
-            } else {
-                match (na.as_f64(), nb.as_f64()) {
+            match (json_number_as_i128(na), json_number_as_i128(nb)) {
+                (Some(ia), Some(ib)) => ia == ib,
+                (Some(i), None) => nb.as_f64().is_some_and(|f| f64_eq_i128(f, i)),
+                (None, Some(i)) => na.as_f64().is_some_and(|f| f64_eq_i128(f, i)),
+                (None, None) => match (na.as_f64(), nb.as_f64()) {
                     (Some(fa), Some(fb)) => fa == fb,
                     _ => false,
-                }
+                },
             }
         }
         (serde_json::Value::Array(aa), serde_json::Value::Array(ab)) => {
@@ -533,19 +629,20 @@ fn term_to_json_depth(term: Term, depth: usize) -> Result<serde_json::Value, rus
     if let Ok(b) = term.decode::<bool>() {
         return Ok(serde_json::Value::Bool(b));
     }
-    if let Ok(i) = term.decode::<i64>() {
-        return Ok(serde_json::Value::Number(i.into()));
-    }
-    if let Ok(u) = term.decode::<u64>() {
-        return Ok(serde_json::Value::Number(u.into()));
-    }
-    if let Ok(f) = term.decode::<f64>() {
+    if term.is_float() {
+        let f = term.decode::<f64>()?;
         if f.is_finite() {
             if let Some(n) = serde_json::Number::from_f64(f) {
                 return Ok(serde_json::Value::Number(n));
             }
         }
         return Err(rustler::Error::BadArg);
+    }
+    if let Ok(i) = term.decode::<i64>() {
+        return Ok(serde_json::Value::Number(i.into()));
+    }
+    if let Ok(u) = term.decode::<u64>() {
+        return Ok(serde_json::Value::Number(u.into()));
     }
     if let Ok(s) = term.decode::<String>() {
         return Ok(serde_json::Value::String(s));
@@ -625,7 +722,7 @@ fn json_to_term<'a>(env: Env<'a>, val: &serde_json::Value, depth: usize) -> NifR
 fn metadata_to_term<'a>(
     env: Env<'a>,
     meta: Option<&HashMap<String, serde_json::Value>>,
-) -> NifResult<Term<'a>> {
+) -> Result<Term<'a>, &'static str> {
     match meta {
         None => Ok(rustler::types::atom::nil().encode(env)),
         Some(map) => {
@@ -633,9 +730,9 @@ fn metadata_to_term<'a>(
             let mut vals = Vec::with_capacity(map.len());
             for (k_str, v) in map {
                 keys.push(k_str.encode(env));
-                vals.push(json_to_term(env, v, 1)?);
+                vals.push(json_to_term(env, v, 1).map_err(|_| "Invalid stored metadata")?);
             }
-            Term::map_from_term_arrays(env, &keys, &vals)
+            Term::map_from_term_arrays(env, &keys, &vals).map_err(|_| "Invalid stored metadata")
         }
     }
 }
@@ -911,7 +1008,9 @@ fn parse_hnsw(term: Term) -> Result<Option<HnswConfig>, String> {
     }
     if let Some(hnsw_map) = rustler::types::map::MapIterator::new(term) {
         let mut cfg = HnswConfig::default();
+        let mut count = 0usize;
         for (hk, hv) in hnsw_map {
+            count += 1;
             let hkey = decode_map_key(hk).map_err(|_| "Invalid key in :hnsw option".to_string())?;
             match hkey.as_str() {
                 "m" => {
@@ -926,6 +1025,9 @@ fn parse_hnsw(term: Term) -> Result<Option<HnswConfig>, String> {
                 "max_elements" => cfg.max_elements = decode_pos_usize(hv, "max_elements")?,
                 other => return Err(format!("Unknown :hnsw option key: {}", other)),
             }
+        }
+        if count == 0 {
+            return Err("Empty :hnsw option map".to_string());
         }
         return Ok(Some(cfg));
     }
@@ -991,7 +1093,8 @@ fn parse_db_options(
     })
 }
 
-fn open_db_impl<'a>(
+#[rustler::nif(schedule = "DirtyIo")]
+fn open_db_with_options<'a>(
     env: Env<'a>,
     path_term: Term<'a>,
     dimensions_term: Term<'a>,
@@ -1026,21 +1129,6 @@ fn open_db_impl<'a>(
         }
         Err(err) => Ok((error(), err).encode(env)),
     }
-}
-
-#[rustler::nif(schedule = "DirtyIo")]
-fn open_db<'a>(env: Env<'a>, path: Term<'a>, dimensions: Term<'a>) -> NifResult<Term<'a>> {
-    open_db_impl(env, path, dimensions, None)
-}
-
-#[rustler::nif(schedule = "DirtyIo")]
-fn open_db_with_options<'a>(
-    env: Env<'a>,
-    path: Term<'a>,
-    dimensions: Term<'a>,
-    options: Option<Term<'a>>,
-) -> NifResult<Term<'a>> {
-    open_db_impl(env, path, dimensions, options)
 }
 
 #[rustler::nif(schedule = "DirtyIo")]
@@ -1111,7 +1199,10 @@ fn get_entry<'a>(
                 return Ok((error(), "Stored vector contains non-finite float").encode(env));
             }
             let entry_id = entry.id.as_deref().unwrap_or(&id_str);
-            let meta_term = metadata_to_term(env, entry.metadata.as_ref())?;
+            let meta_term = match metadata_to_term(env, entry.metadata.as_ref()) {
+                Ok(t) => t,
+                Err(msg) => return Ok((error(), msg).encode(env)),
+            };
             let map = rustler::term_map!(env, {
                 id() => entry_id,
                 vector() => entry.vector,
@@ -1243,7 +1334,7 @@ fn search<'a>(
         ef_search: None,
     };
 
-    match with_db(&db_ref, |db| db.search(query)) {
+    match with_db(&db_ref, |db| db.search(query, false)) {
         Ok(results) => {
             if results.iter().any(|r| !r.score.is_finite()) {
                 return Ok((error(), "Search produced non-finite score").encode(env));
@@ -1294,7 +1385,7 @@ fn search_detailed<'a>(
         ef_search: ef_search_arg,
     };
 
-    match with_db(&db_ref, |db| db.search(query)) {
+    match with_db(&db_ref, |db| db.search(query, true)) {
         Ok(results) => {
             let mut terms = Vec::with_capacity(results.len());
             for r in results {
@@ -1312,7 +1403,10 @@ fn search_detailed<'a>(
                     }
                     None => rustler::types::atom::nil().encode(env),
                 };
-                let meta_term = metadata_to_term(env, r.metadata.as_ref())?;
+                let meta_term = match metadata_to_term(env, r.metadata.as_ref()) {
+                    Ok(t) => t,
+                    Err(msg) => return Ok((error(), msg).encode(env)),
+                };
                 let map = rustler::term_map!(env, {
                     id() => r.id,
                     score() => r.score,
@@ -1327,8 +1421,7 @@ fn search_detailed<'a>(
     }
 }
 
-#[rustler::nif(schedule = "DirtyCpu")]
-fn calculate_distance<'a>(
+fn calculate_distance_impl<'a>(
     env: Env<'a>,
     a_term: Term<'a>,
     b_term: Term<'a>,
@@ -1352,6 +1445,26 @@ fn calculate_distance<'a>(
         Ok(_) => Ok((error(), "Distance calculation produced non-finite value").encode(env)),
         Err(err) => Ok((error(), err.to_string()).encode(env)),
     }
+}
+
+#[rustler::nif]
+fn calculate_distance<'a>(
+    env: Env<'a>,
+    a_term: Term<'a>,
+    b_term: Term<'a>,
+    metric_term: Term<'a>,
+) -> NifResult<Term<'a>> {
+    calculate_distance_impl(env, a_term, b_term, metric_term)
+}
+
+#[rustler::nif(schedule = "DirtyCpu")]
+fn calculate_distance_dirty<'a>(
+    env: Env<'a>,
+    a_term: Term<'a>,
+    b_term: Term<'a>,
+    metric_term: Term<'a>,
+) -> NifResult<Term<'a>> {
+    calculate_distance_impl(env, a_term, b_term, metric_term)
 }
 
 fn encode_metric_atom<'a>(env: Env<'a>, metric: DistanceMetric) -> Term<'a> {

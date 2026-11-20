@@ -177,4 +177,66 @@ defmodule RuvectorElixir.ConcurrencyTest do
       assert {:ok, 80} = RuvectorElixir.len(hnsw_db)
     end
   end
+
+  describe "memory:// upserts, deletes, ef_search, and concurrency (flat & HNSW)" do
+    for hnsw_opt <- [false, [m: 16, ef_construction: 64, ef_search: 32, max_elements: 1_000]] do
+      test "upsert, delete, ef_search, and concurrent ops on memory:// with hnsw=#{inspect(hnsw_opt)}" do
+        hnsw_mode = unquote(Macro.escape(hnsw_opt))
+
+        assert {:ok, db} =
+                 RuvectorElixir.open("memory://mem_suite", 8, metric: :euclidean, hnsw: hnsw_mode)
+
+        # Upsert replaces stored vector and indexed vector atomically
+        assert {:ok, "u1"} =
+                 RuvectorElixir.insert(db, %{
+                   id: "u1",
+                   vector: [10.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+                   metadata: %{"rev" => 1}
+                 })
+
+        assert {:ok, "u1"} =
+                 RuvectorElixir.insert(db, %{
+                   id: "u1",
+                   vector: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+                   metadata: %{"rev" => 2}
+                 })
+
+        assert {:ok, 1} = RuvectorElixir.len(db)
+
+        assert {:ok, [res]} =
+                 RuvectorElixir.search_detailed(db, List.duplicate(0.0, 8), 1, ef_search: 64)
+
+        assert res.id == "u1"
+        assert res.metadata == %{"rev" => 2}
+        assert_in_delta res.score, 0.0, 0.001
+
+        # Delete removes from both store and index
+        assert {:ok, true} = RuvectorElixir.delete(db, "u1")
+        assert {:ok, []} = RuvectorElixir.search(db, List.duplicate(0.0, 8), 5)
+
+        # Concurrent reads, writes, upserts, and deletes on memory://
+        tasks =
+          for t <- 0..7 do
+            Task.async(fn ->
+              for i <- 0..9 do
+                id = "m_#{t}_#{i}"
+                vec = for j <- 0..7, do: (t + i + j) * 0.1
+                assert {:ok, ^id} = RuvectorElixir.insert(db, %{id: id, vector: vec})
+                assert {:ok, ^id} = RuvectorElixir.insert(db, %{id: id, vector: vec})
+                assert {:ok, entry} = RuvectorElixir.get(db, id)
+                assert entry.id == id
+              end
+
+              assert {:ok, true} = RuvectorElixir.delete(db, "m_#{t}_0")
+              assert {:ok, ids} = RuvectorElixir.search(db, List.duplicate(0.5, 8), 5)
+              assert length(ids) > 0
+            end)
+          end
+
+        Task.await_many(tasks, 10_000)
+        assert {:ok, 72} = RuvectorElixir.len(db)
+        assert :ok = RuvectorElixir.close(db)
+      end
+    end
+  end
 end

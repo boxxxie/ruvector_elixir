@@ -158,6 +158,28 @@ defmodule RuvectorElixir.SearchFilterTest do
                RuvectorElixir.search(db, List.duplicate(0.0, 16), 5, filter: %{"version" => 1})
     end
 
+    test "distinct 64-bit integers above 2^53 do not collide in filter equality", %{db: db} do
+      a = 9_007_199_254_740_992
+      b = 9_007_199_254_740_993
+
+      assert {:ok, "big_a"} =
+               RuvectorElixir.insert(db, %{
+                 id: "big_a",
+                 vector: List.duplicate(0.2, 16),
+                 metadata: %{"snowflake" => a}
+               })
+
+      assert {:ok, "big_b"} =
+               RuvectorElixir.insert(db, %{
+                 id: "big_b",
+                 vector: List.duplicate(0.2, 16),
+                 metadata: %{"snowflake" => b}
+               })
+
+      assert {:ok, ["big_b"]} =
+               RuvectorElixir.search(db, List.duplicate(0.2, 16), 5, filter: %{"snowflake" => b})
+    end
+
     test "search! and search_detailed! return direct results and raise RuvectorElixir.Error on operational error",
          %{db: db} do
       query = for j <- 0..15, do: j * 0.1

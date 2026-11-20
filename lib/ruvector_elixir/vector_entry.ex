@@ -3,7 +3,7 @@ defmodule RuvectorElixir.VectorEntry do
   Represents a vector entry stored in or retrieved from a Ruvector database.
 
   An entry consists of:
-  - `id`: Optional unique string identifier (auto-generated UUID if omitted upon insert).
+  - `id`: Optional unique UTF-8 string identifier (auto-generated UUID if omitted upon insert).
   - `vector`: List of floating point numbers representing the vector embedding (stored as 32-bit `f32` in Rust; non-dyadic 64-bit floats are rounded to `f32` precision on insert).
   - `metadata`: Optional arbitrary map of JSON-serializable key-value metadata.
   """
@@ -20,11 +20,12 @@ defmodule RuvectorElixir.VectorEntry do
   @doc """
   Creates a new `VectorEntry` struct.
 
-  Accepts vectors with float or integer components (automatically converted to floats).
+  Accepts vectors with finite `f32`-representable float or integer components (automatically
+  converted to floats).
 
   ## Options
 
-  - `:id` - Unique string identifier (or non-boolean atom / integer).
+  - `:id` - Unique UTF-8 string identifier (or non-boolean atom / integer).
   - `:metadata` - Plain map of JSON-serializable metadata attributes.
 
   ## Examples
@@ -44,20 +45,17 @@ defmodule RuvectorElixir.VectorEntry do
       raise ArgumentError, "VectorEntry options must be a keyword list or map"
     end
 
-    validate_option_keys!(Keyword.keys(opts))
+    %{id: raw_id, metadata: raw_metadata} = extract_opts!(opts)
 
     %__MODULE__{
       vector: normalize_vector!(vector),
-      id: normalize_id!(Keyword.get(opts, :id)),
-      metadata: normalize_metadata!(Keyword.get(opts, :metadata))
+      id: normalize_id!(raw_id),
+      metadata: normalize_metadata!(raw_metadata)
     }
   end
 
   def new(vector, %{} = opts) when is_list(vector) and not is_struct(opts) do
-    validate_option_keys!(Map.keys(opts))
-
-    raw_id = fetch_key(opts, :id, "id")
-    raw_metadata = fetch_key(opts, :metadata, "metadata")
+    %{id: raw_id, metadata: raw_metadata} = extract_opts!(opts)
 
     %__MODULE__{
       vector: normalize_vector!(vector),
@@ -82,39 +80,76 @@ defmodule RuvectorElixir.VectorEntry do
 
   """
   @spec from_map(map()) :: t()
-  def from_map(%{vector: vector} = map) when is_list(vector) do
-    %__MODULE__{
-      vector: ensure_float_list!(vector),
-      id: normalize_id!(fetch_key(map, :id, "id")),
-      metadata: normalize_metadata!(fetch_key(map, :metadata, "metadata"))
-    }
-  end
+  def from_map(%{} = map) when not is_struct(map) do
+    if Map.has_key?(map, :vector) and Map.has_key?(map, "vector") do
+      raise ArgumentError, "VectorEntry.from_map/1 map cannot contain both :vector and \"vector\""
+    end
 
-  def from_map(%{"vector" => vector} = map) when is_list(vector) do
+    vector =
+      case Map.fetch(map, :vector) do
+        {:ok, v} -> v
+        :error -> Map.get(map, "vector")
+      end
+
+    if not is_list(vector) do
+      raise ArgumentError, "VectorEntry.from_map/1 expects a map with a :vector list"
+    end
+
+    %{id: raw_id, metadata: raw_metadata} = extract_entry_fields!(map)
+
     %__MODULE__{
       vector: ensure_float_list!(vector),
-      id: normalize_id!(fetch_key(map, :id, "id")),
-      metadata: normalize_metadata!(fetch_key(map, :metadata, "metadata"))
+      id: normalize_id!(raw_id),
+      metadata: normalize_metadata!(raw_metadata)
     }
   end
 
   def from_map(_other) do
-    raise ArgumentError, "VectorEntry.from_map/1 expects a map with a :vector list"
+    raise ArgumentError, "VectorEntry.from_map/1 expects a plain map with a :vector list"
   end
 
-  defp fetch_key(map, atom_key, string_key) do
-    case Map.fetch(map, atom_key) do
-      {:ok, value} -> value
-      :error -> Map.get(map, string_key)
-    end
-  end
+  defp extract_opts!(enum) do
+    Enum.reduce(enum, %{id: nil, metadata: nil, seen: MapSet.new()}, fn {k, v}, acc ->
+      key =
+        case k do
+          k when k in [:id, "id"] -> :id
+          k when k in [:metadata, "metadata"] -> :metadata
+          other -> raise ArgumentError, "Unknown VectorEntry option: #{inspect(other)}"
+        end
 
-  defp validate_option_keys!(keys) do
-    Enum.each(keys, fn key ->
-      if key not in [:id, :metadata, "id", "metadata"] do
-        raise ArgumentError, "Unknown VectorEntry option: #{inspect(key)}"
+      if MapSet.member?(acc.seen, key) do
+        raise ArgumentError, "Duplicate VectorEntry option: #{inspect(key)}"
       end
+
+      acc
+      |> Map.put(key, v)
+      |> Map.update!(:seen, &MapSet.put(&1, key))
     end)
+  end
+
+  defp extract_entry_fields!(map) do
+    if Map.has_key?(map, :id) and Map.has_key?(map, "id") do
+      raise ArgumentError, "VectorEntry.from_map/1 map cannot contain both :id and \"id\""
+    end
+
+    if Map.has_key?(map, :metadata) and Map.has_key?(map, "metadata") do
+      raise ArgumentError,
+            "VectorEntry.from_map/1 map cannot contain both :metadata and \"metadata\""
+    end
+
+    id =
+      case Map.fetch(map, :id) do
+        {:ok, v} -> v
+        :error -> Map.get(map, "id")
+      end
+
+    metadata =
+      case Map.fetch(map, :metadata) do
+        {:ok, v} -> v
+        :error -> Map.get(map, "metadata")
+      end
+
+    %{id: id, metadata: metadata}
   end
 
   defp normalize_id!(nil), do: nil
@@ -122,7 +157,14 @@ defmodule RuvectorElixir.VectorEntry do
   defp normalize_id!(atom) when is_atom(atom), do: Atom.to_string(atom)
   defp normalize_id!(int) when is_integer(int), do: Integer.to_string(int)
   defp normalize_id!(""), do: raise(ArgumentError, "VectorEntry :id cannot be an empty string")
-  defp normalize_id!(str) when is_binary(str), do: str
+
+  defp normalize_id!(str) when is_binary(str) do
+    if not String.valid?(str) do
+      raise ArgumentError, "VectorEntry :id must be a valid UTF-8 string"
+    end
+
+    str
+  end
 
   defp normalize_id!(other) do
     raise ArgumentError,
@@ -130,19 +172,41 @@ defmodule RuvectorElixir.VectorEntry do
   end
 
   defp normalize_vector!(vector) do
-    Enum.map(vector, fn
-      val when is_float(val) -> val
-      val when is_integer(val) -> val * 1.0
-      other -> raise ArgumentError, "Vector elements must be numbers, got: #{inspect(other)}"
-    end)
+    Enum.map(vector, &to_finite_f32_float!/1)
   end
 
   defp ensure_float_list!(vector) do
-    if Enum.all?(vector, &is_float/1) do
+    if Enum.all?(vector, &(is_float(&1) and finite_f32?(&1))) do
       vector
     else
       normalize_vector!(vector)
     end
+  end
+
+  defp to_finite_f32_float!(val) when is_float(val) do
+    if finite_f32?(val) do
+      val
+    else
+      raise ArgumentError, "Vector element overflows 32-bit float range: #{inspect(val)}"
+    end
+  end
+
+  defp to_finite_f32_float!(val) when is_integer(val) do
+    f = val * 1.0
+
+    if finite_f32?(f) do
+      f
+    else
+      raise ArgumentError, "Vector element overflows 32-bit float range: #{inspect(val)}"
+    end
+  end
+
+  defp to_finite_f32_float!(other) do
+    raise ArgumentError, "Vector elements must be numbers, got: #{inspect(other)}"
+  end
+
+  defp finite_f32?(val) do
+    not match?(<<_::1, 255::8, _::23>>, <<val::float-32>>)
   end
 
   defp normalize_metadata!(nil), do: nil

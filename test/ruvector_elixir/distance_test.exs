@@ -80,6 +80,13 @@ defmodule RuvectorElixir.DistanceTest do
                RuvectorElixir.distance([1.0e100, 0.0], [0.0, 1.0], :euclidean)
     end
 
+    test "large vectors (> 4096 dims) route through DirtyCpu cleanly" do
+      a = List.duplicate(1.0, 5_000)
+      b = List.duplicate(1.0, 5_000)
+      assert {:ok, dist} = RuvectorElixir.distance(a, b, :euclidean)
+      assert_in_delta dist, 0.0, 0.001
+    end
+
     test "distance! returns float or raises RuvectorElixir.Error" do
       a = [0.0, 0.0]
       b = [3.0, 4.0]

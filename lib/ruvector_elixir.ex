@@ -116,7 +116,8 @@ defmodule RuvectorElixir do
   ## In-Memory Databases
 
   Use a path prefixed with `memory://` (e.g. `"memory://transient"`) for a pure in-memory database
-  that does not touch the filesystem.
+  that does not touch the filesystem. Every `open("memory://...", ...)` call allocates an
+  independent, isolated in-memory database instance regardless of the URI suffix.
 
   ## Examples
 
@@ -370,9 +371,9 @@ defmodule RuvectorElixir do
     Native.search(db_ref, query_vector, filter, k)
   end
 
-  def search(_db_ref, _query_vector, k, _opts) do
+  def search(db_ref, query_vector, k, _opts) do
     raise ArgumentError,
-          "Invalid arguments to RuvectorElixir.search/4: expected db_ref, list vector, and non-negative integer k, got k=#{inspect(k)}"
+          "Invalid arguments to RuvectorElixir.search/4: expected db_ref, list vector, and non-negative integer k, got db_ref=#{inspect(db_ref)}, query_vector=#{inspect(query_vector)}, k=#{inspect(k)}"
   end
 
   @doc """
@@ -418,9 +419,9 @@ defmodule RuvectorElixir do
     Native.search_detailed(db_ref, query_vector, filter, k, ef_search)
   end
 
-  def search_detailed(_db_ref, _query_vector, k, _opts) do
+  def search_detailed(db_ref, query_vector, k, _opts) do
     raise ArgumentError,
-          "Invalid arguments to RuvectorElixir.search_detailed/4: expected db_ref, list vector, and non-negative integer k, got k=#{inspect(k)}"
+          "Invalid arguments to RuvectorElixir.search_detailed/4: expected db_ref, list vector, and non-negative integer k, got db_ref=#{inspect(db_ref)}, query_vector=#{inspect(query_vector)}, k=#{inspect(k)}"
   end
 
   @doc """
@@ -456,9 +457,16 @@ defmodule RuvectorElixir do
   @spec distance(vector(), vector(), metric()) :: {:ok, float()} | {:error, String.t()}
   def distance(a, b, metric \\ :cosine)
 
+  @dirty_distance_threshold 4096
+
   def distance(a, b, metric) when is_list(a) and is_list(b) do
     validated_metric = validate_metric!(metric)
-    Native.calculate_distance(a, b, validated_metric)
+
+    if length(a) > @dirty_distance_threshold or length(b) > @dirty_distance_threshold do
+      Native.calculate_distance_dirty(a, b, validated_metric)
+    else
+      Native.calculate_distance(a, b, validated_metric)
+    end
   end
 
   def distance(_a, _b, _metric) do
@@ -504,13 +512,20 @@ defmodule RuvectorElixir do
       raise ArgumentError, "Database options must be a keyword list or plain map"
     end
 
-    opts
-    |> Map.new()
-    |> normalize_options!(dimensions)
+    reduce_db_options!(opts, dimensions)
   end
 
   defp normalize_options!(%{} = map, dimensions) when not is_struct(map) do
-    Enum.reduce(map, %{}, fn {k, v}, acc ->
+    reduce_db_options!(map, dimensions)
+  end
+
+  defp normalize_options!(other, _dimensions) do
+    raise ArgumentError,
+          "Database options must be a keyword list or plain map, got: #{inspect(other)}"
+  end
+
+  defp reduce_db_options!(enum, dimensions) do
+    Enum.reduce(enum, %{}, fn {k, v}, acc ->
       key = normalize_opt_key!(k)
 
       if Map.has_key?(acc, key) do
@@ -544,11 +559,6 @@ defmodule RuvectorElixir do
     end)
   end
 
-  defp normalize_options!(other, _dimensions) do
-    raise ArgumentError,
-          "Database options must be a keyword list or plain map, got: #{inspect(other)}"
-  end
-
   defp normalize_opt_key!(k) when is_boolean(k) or is_nil(k) do
     raise ArgumentError, "Invalid option key: #{inspect(k)}"
   end
@@ -577,16 +587,31 @@ defmodule RuvectorElixir do
   defp normalize_hnsw!(nil), do: nil
   defp normalize_hnsw!(b) when is_boolean(b), do: b
 
+  defp normalize_hnsw!([]), do: raise(ArgumentError, ":hnsw option list cannot be empty")
+
   defp normalize_hnsw!(opts) when is_list(opts) do
     if not Keyword.keyword?(opts) do
       raise ArgumentError, ":hnsw options must be a keyword list, plain map, or boolean"
     end
 
-    opts |> Map.new() |> normalize_hnsw!()
+    reduce_hnsw_options!(opts)
   end
 
   defp normalize_hnsw!(%{} = map) when not is_struct(map) do
-    Enum.reduce(map, %{}, fn {hk, hv}, acc ->
+    if map_size(map) == 0 do
+      raise ArgumentError, ":hnsw option map cannot be empty"
+    end
+
+    reduce_hnsw_options!(map)
+  end
+
+  defp normalize_hnsw!(other) do
+    raise ArgumentError,
+          ":hnsw must be a boolean, keyword list, or plain map, got: #{inspect(other)}"
+  end
+
+  defp reduce_hnsw_options!(enum) do
+    Enum.reduce(enum, %{}, fn {hk, hv}, acc ->
       hkey = normalize_opt_key!(hk)
 
       if Map.has_key?(acc, hkey) do
@@ -610,11 +635,6 @@ defmodule RuvectorElixir do
     end)
   end
 
-  defp normalize_hnsw!(other) do
-    raise ArgumentError,
-          ":hnsw must be a boolean, keyword list, or plain map, got: #{inspect(other)}"
-  end
-
   defp normalize_quantization!(nil, _dimensions), do: nil
 
   defp normalize_quantization!(q, _dimensions) when q in [:scalar, :binary, :none], do: q
@@ -627,13 +647,17 @@ defmodule RuvectorElixir do
     end
   end
 
+  defp normalize_quantization!([], _dimensions) do
+    raise ArgumentError, ":quantization option list cannot be empty"
+  end
+
   defp normalize_quantization!(opts, dimensions) when is_list(opts) do
     if not Keyword.keyword?(opts) do
       raise ArgumentError,
             ":quantization options must be a keyword list, plain map, or atom/string"
     end
 
-    opts |> Map.new() |> normalize_quantization!(dimensions)
+    reduce_quantization_options!(opts, dimensions)
   end
 
   defp normalize_quantization!(%{} = map, dimensions) when not is_struct(map) do
@@ -641,8 +665,16 @@ defmodule RuvectorElixir do
       raise ArgumentError, ":quantization option map cannot be empty"
     end
 
+    reduce_quantization_options!(map, dimensions)
+  end
+
+  defp normalize_quantization!(other, _dimensions) do
+    raise ArgumentError, "Unsupported :quantization option: #{inspect(other)}"
+  end
+
+  defp reduce_quantization_options!(enum, dimensions) do
     normalized =
-      Enum.reduce(map, %{}, fn {qk, qv}, acc ->
+      Enum.reduce(enum, %{}, fn {qk, qv}, acc ->
         qkey = normalize_opt_key!(qk)
 
         if Map.has_key?(acc, qkey) do
@@ -694,10 +726,6 @@ defmodule RuvectorElixir do
     normalized
   end
 
-  defp normalize_quantization!(other, _dimensions) do
-    raise ArgumentError, "Unsupported :quantization option: #{inspect(other)}"
-  end
-
   defp validate_quantization_type!(t) when t in [:scalar, :binary, :none, :product], do: t
 
   defp validate_quantization_type!(t) when is_binary(t) do
@@ -717,34 +745,47 @@ defmodule RuvectorElixir do
       raise ArgumentError, "Search options must be a keyword list or plain map"
     end
 
-    validate_search_opts!(Map.new(opts), allowed_keys)
+    reduce_search_opts!(opts, allowed_keys)
   end
 
   defp validate_search_opts!(%{} = opts, allowed_keys) when not is_struct(opts) do
-    Enum.each(opts, fn {k, _v} ->
-      if k not in allowed_keys do
-        raise ArgumentError,
-              "Unknown search option #{inspect(k)}; allowed options: #{inspect(allowed_keys)}"
-      end
-    end)
-
-    filter = Map.get(opts, :filter)
-    validate_filter!(filter)
-
-    ef_search = Map.get(opts, :ef_search)
-
-    if :ef_search in allowed_keys and ef_search != nil and
-         not (is_integer(ef_search) and ef_search > 0) do
-      raise ArgumentError,
-            ":ef_search must be a positive integer or nil, got: #{inspect(ef_search)}"
-    end
-
-    %{filter: filter, ef_search: ef_search}
+    reduce_search_opts!(opts, allowed_keys)
   end
 
   defp validate_search_opts!(other, _allowed_keys) do
     raise ArgumentError,
           "Search options must be a keyword list or plain map, got: #{inspect(other)}"
+  end
+
+  defp reduce_search_opts!(enum, allowed_keys) do
+    acc =
+      Enum.reduce(enum, %{seen: MapSet.new(), filter: nil, ef_search: nil}, fn {k, v}, acc ->
+        if k not in allowed_keys do
+          raise ArgumentError,
+                "Unknown search option #{inspect(k)}; allowed options: #{inspect(allowed_keys)}"
+        end
+
+        if MapSet.member?(acc.seen, k) do
+          raise ArgumentError, "Duplicate search option: #{inspect(k)}"
+        end
+
+        case k do
+          :filter ->
+            validate_filter!(v)
+
+          :ef_search ->
+            if v != nil and not (is_integer(v) and v > 0) do
+              raise ArgumentError,
+                    ":ef_search must be a positive integer or nil, got: #{inspect(v)}"
+            end
+        end
+
+        acc
+        |> Map.put(k, v)
+        |> Map.update!(:seen, &MapSet.put(&1, k))
+      end)
+
+    %{filter: acc.filter, ef_search: acc.ef_search}
   end
 
   defp validate_filter!(nil), do: :ok

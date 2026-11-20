@@ -294,7 +294,7 @@ defmodule RuvectorElixir.EdgeCasesTest do
                RuvectorElixir.search(db, [1.0, 0.0, 0.0, 0.0], 5, filter: %{"bad" => {:tuple}})
     end
 
-    test "rejects invalid open/3 options strictly", %{tmp_dir: tmp_dir} do
+    test "rejects invalid open/3 options strictly", %{db: db, tmp_dir: tmp_dir} do
       db_path = Path.join(tmp_dir, "invalid_opts.rvf")
 
       assert_raise ArgumentError, fn ->
@@ -350,6 +350,30 @@ defmodule RuvectorElixir.EdgeCasesTest do
       end
 
       assert_raise ArgumentError, fn ->
+        RuvectorElixir.open(db_path, 4, metric: :invalid, metric: :cosine)
+      end
+
+      assert_raise ArgumentError, fn ->
+        RuvectorElixir.open(db_path, 4, hnsw: [])
+      end
+
+      assert_raise ArgumentError, fn ->
+        RuvectorElixir.open(db_path, 4, hnsw: %{})
+      end
+
+      assert_raise ArgumentError, fn ->
+        RuvectorElixir.search(db, [1.0, 0.0, 0.0, 0.0], 5, ef_search: -1, ef_search: 10)
+      end
+
+      assert_raise ArgumentError, ~r/query_vector=/, fn ->
+        RuvectorElixir.search(db, :not_a_list, 5)
+      end
+
+      assert_raise ArgumentError, ~r/db_ref=/, fn ->
+        RuvectorElixir.search_detailed(:not_a_ref, [1.0, 0.0, 0.0, 0.0], 5)
+      end
+
+      assert_raise ArgumentError, fn ->
         RuvectorElixir.open(db_path, 4, quantization: %{type: :product, subspaces: 3, k: 256})
       end
     end
@@ -386,40 +410,33 @@ defmodule RuvectorElixir.EdgeCasesTest do
       end
     end
 
-    test "memory:// database works without creating files on disk", %{tmp_dir: tmp_dir} do
-      prev_cwd = File.cwd!()
+    test "memory:// database works without creating files on disk" do
+      assert {:ok, mem_db} = RuvectorElixir.open("memory://transient", 4, metric: :euclidean)
 
-      try do
-        File.cd!(tmp_dir)
-        assert {:ok, mem_db} = RuvectorElixir.open("memory://transient", 4, metric: :euclidean)
+      assert {:ok, "m1"} =
+               RuvectorElixir.insert(mem_db, %{
+                 id: "m1",
+                 vector: [1.0, 0.0, 0.0, 0.0],
+                 metadata: %{"kind" => "ephemeral"}
+               })
 
-        assert {:ok, "m1"} =
-                 RuvectorElixir.insert(mem_db, %{
-                   id: "m1",
-                   vector: [1.0, 0.0, 0.0, 0.0],
-                   metadata: %{"kind" => "ephemeral"}
-                 })
+      assert {:ok, 1} = RuvectorElixir.len(mem_db)
+      assert {:ok, ["m1"]} = RuvectorElixir.search(mem_db, [1.0, 0.0, 0.0, 0.0], 1)
 
-        assert {:ok, 1} = RuvectorElixir.len(mem_db)
-        assert {:ok, ["m1"]} = RuvectorElixir.search(mem_db, [1.0, 0.0, 0.0, 0.0], 1)
+      assert {:ok, [res]} =
+               RuvectorElixir.search_detailed(mem_db, [1.0, 0.0, 0.0, 0.0], 1,
+                 filter: %{"kind" => "ephemeral"}
+               )
 
-        assert {:ok, [res]} =
-                 RuvectorElixir.search_detailed(mem_db, [1.0, 0.0, 0.0, 0.0], 1,
-                   filter: %{"kind" => "ephemeral"}
-                 )
+      assert res.id == "m1"
+      assert {:ok, info} = RuvectorElixir.info(mem_db)
+      assert info.storage_path == "memory://transient"
 
-        assert res.id == "m1"
-        assert {:ok, info} = RuvectorElixir.info(mem_db)
-        assert info.storage_path == "memory://transient"
-
-        refute File.exists?(Path.join(tmp_dir, "memory:"))
-        assert :ok = RuvectorElixir.close(mem_db)
-      after
-        File.cd!(prev_cwd)
-      end
+      refute File.exists?(Path.join(File.cwd!(), "memory:"))
+      assert :ok = RuvectorElixir.close(mem_db)
     end
 
-    test "VectorEntry.new/2 and VectorEntry.from_map/1 enforce ID and metadata invariants" do
+    test "VectorEntry.new/2 and VectorEntry.from_map/1 enforce ID, vector, and metadata invariants" do
       assert_raise ArgumentError, fn ->
         VectorEntry.new([1.0, 2.0], id: 3.14)
       end
@@ -429,7 +446,23 @@ defmodule RuvectorElixir.EdgeCasesTest do
       end
 
       assert_raise ArgumentError, fn ->
+        VectorEntry.new([1.0, 2.0], id: "")
+      end
+
+      assert_raise ArgumentError, fn ->
+        VectorEntry.new([1.0, 2.0], id: <<0xFF, 0xFE>>)
+      end
+
+      assert_raise ArgumentError, fn ->
+        VectorEntry.new([1.0e100, 2.0])
+      end
+
+      assert_raise ArgumentError, fn ->
         VectorEntry.new([1.0, 2.0], metadata: ~D[2026-01-01])
+      end
+
+      assert_raise ArgumentError, fn ->
+        VectorEntry.from_map(%{:id => nil, "id" => "doc_1", :vector => [1.0, 2.0]})
       end
 
       entry = VectorEntry.from_map(%{id: 42, vector: [1.0, 2.0], metadata: nil})

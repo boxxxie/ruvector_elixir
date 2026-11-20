@@ -50,6 +50,7 @@ defmodule RuvectorElixir.MixProject do
         "native/ruvector_nif/Cargo.toml",
         "native/ruvector_nif/Cargo.lock",
         "native/ruvector_nif/README.md",
+        "usage-rules.md",
         "mix.exs",
         ".formatter.exs",
         "README.md",

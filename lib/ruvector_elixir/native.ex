@@ -3,9 +3,6 @@ defmodule RuvectorElixir.Native do
 
   use Rustler, otp_app: :ruvector_elixir, crate: "ruvector_nif"
 
-  @spec open_db(String.t(), pos_integer()) :: {:ok, reference()} | {:error, String.t()}
-  def open_db(_path, _dimensions), do: :erlang.nif_error(:nif_not_loaded)
-
   @spec open_db_with_options(String.t(), pos_integer(), %{optional(String.t()) => term()} | nil) ::
           {:ok, reference()} | {:error, String.t()}
   def open_db_with_options(_path, _dimensions, _options), do: :erlang.nif_error(:nif_not_loaded)
@@ -16,7 +13,7 @@ defmodule RuvectorElixir.Native do
   @spec insert(reference(), term()) :: {:ok, String.t()} | {:error, :closed | String.t()}
   def insert(_db_ref, _entry), do: :erlang.nif_error(:nif_not_loaded)
 
-  @spec insert_batch(reference(), [term()]) ::
+  @spec insert_batch(reference(), term()) ::
           {:ok, [String.t()]} | {:error, :closed | String.t()}
   def insert_batch(_db_ref, _entries), do: :erlang.nif_error(:nif_not_loaded)
 
@@ -54,6 +51,10 @@ defmodule RuvectorElixir.Native do
   @spec calculate_distance([number()], [number()], atom() | String.t()) ::
           {:ok, float()} | {:error, String.t()}
   def calculate_distance(_a, _b, _metric), do: :erlang.nif_error(:nif_not_loaded)
+
+  @spec calculate_distance_dirty([number()], [number()], atom() | String.t()) ::
+          {:ok, float()} | {:error, String.t()}
+  def calculate_distance_dirty(_a, _b, _metric), do: :erlang.nif_error(:nif_not_loaded)
 
   @spec info(reference()) :: {:ok, map()} | {:error, :closed | String.t()}
   def info(_db_ref), do: :erlang.nif_error(:nif_not_loaded)
