@@ -1,4 +1,4 @@
-use parking_lot::RwLock;
+use parking_lot::{Mutex, RwLock};
 use rustler::{Encoder, Env, NifResult, ResourceArc, Term};
 use ruvector_core::distance::distance;
 use ruvector_core::index::flat::FlatIndex;
@@ -12,7 +12,10 @@ use ruvector_core::VectorDB;
 use std::collections::{HashMap, HashSet};
 use std::sync::{mpsc, OnceLock};
 
-const MAX_JSON_DEPTH: usize = 128;
+// Matches serde_json's default recursion limit of 128 (allows up to 127 nested JSON containers).
+const MAX_JSON_DEPTH: usize = 127;
+const MAX_HNSW_MAX_ELEMENTS: usize = 10_000_000;
+const MAX_HNSW_EF: usize = 1_000_000;
 
 enum MemoryIndex {
     Flat(FlatIndex),
@@ -60,6 +63,7 @@ impl MemoryIndex {
 struct InMemoryState {
     entries: HashMap<String, VectorEntry>,
     index: MemoryIndex,
+    indexed_count: usize,
 }
 
 struct InMemoryDB {
@@ -81,6 +85,7 @@ impl InMemoryDB {
             state: RwLock::new(InMemoryState {
                 entries: HashMap::new(),
                 index,
+                indexed_count: 0,
             }),
             options,
         })
@@ -109,6 +114,7 @@ impl InMemoryDB {
         }
 
         state.index.add(id.clone(), vec_for_index)?;
+        state.indexed_count = state.indexed_count.saturating_add(1);
         state.entries.insert(id.clone(), entry);
 
         Ok(id)
@@ -138,7 +144,9 @@ impl InMemoryDB {
             }
         }
 
+        let added = index_entries.len();
         state.index.add_batch(index_entries)?;
+        state.indexed_count = state.indexed_count.saturating_add(added);
         for (id, entry) in prepared {
             state.entries.insert(id, entry);
         }
@@ -154,11 +162,12 @@ impl InMemoryDB {
     fn delete(&self, id: &str) -> Result<bool, String> {
         let mut state = self.state.write();
 
-        let removed = state.entries.remove(id).is_some();
-        if removed {
-            let _ = state.index.remove(&id.to_string())?;
+        if !state.entries.contains_key(id) {
+            return Ok(false);
         }
-        Ok(removed)
+        let _ = state.index.remove(&id.to_string())?;
+        state.entries.remove(id);
+        Ok(true)
     }
 
     fn len(&self) -> Result<usize, String> {
@@ -182,6 +191,8 @@ impl InMemoryDB {
             ));
         }
 
+        validate_vector_for_metric(&query.vector, self.options.distance_metric)?;
+
         if query.k == 0 {
             return Ok(Vec::new());
         }
@@ -195,8 +206,20 @@ impl InMemoryDB {
             self.options.hnsw_config.is_some(),
             query.filter.is_some(),
             |fetch_k| {
-                let effective_ef = query.ef_search.map(|ef| ef.max(fetch_k));
-                let candidates = state.index.search(&query.vector, fetch_k, effective_ef)?;
+                let (bounded_fetch_k, effective_ef) = match &self.options.hnsw_config {
+                    Some(cfg) => {
+                        let graph_cap = state.indexed_count.max(1);
+                        let bounded_k = fetch_k.min(graph_cap);
+                        let requested_ef = query.ef_search.unwrap_or(cfg.ef_search);
+                        let bounded_ef = requested_ef.max(bounded_k).min(graph_cap);
+                        (bounded_k, Some(bounded_ef))
+                    }
+                    None => (fetch_k, None),
+                };
+                let candidates =
+                    state
+                        .index
+                        .search(&query.vector, bounded_fetch_k, effective_ef)?;
                 let mut seen_ids = HashSet::with_capacity(candidates.len());
                 let mut live_count = 0usize;
                 let mut matched = Vec::new();
@@ -285,24 +308,26 @@ where
     F: FnMut(usize) -> Result<IndexPass, String>,
     G: FnOnce() -> Result<Vec<SearchResult>, String>,
 {
-    if k == 0 || total_live == 0 {
+    let target_k = k.min(total_live);
+    if target_k == 0 {
         return Ok(Vec::new());
     }
 
     if !has_hnsw {
         if !has_filter {
-            let mut pass = run_index(k)?;
-            if pass.matched.len() >= k || pass.matched.len() >= total_live {
-                pass.matched.truncate(k);
+            let mut pass = run_index(target_k)?;
+            if pass.matched.len() >= target_k {
+                pass.matched.truncate(target_k);
                 return Ok(pass.matched);
             }
             return fallback_scan();
         }
 
-        let initial_k = k.saturating_mul(4).max(64).min(total_live);
+        let initial_k = target_k.saturating_mul(4).max(64).min(total_live);
         let mut pass = run_index(initial_k)?;
-        if pass.matched.len() >= k || initial_k >= total_live || pass.raw_count >= total_live {
-            pass.matched.truncate(k);
+        if pass.matched.len() >= target_k || initial_k >= total_live || pass.raw_count >= total_live
+        {
+            pass.matched.truncate(target_k);
             return Ok(pass.matched);
         }
 
@@ -310,24 +335,24 @@ where
     }
 
     if !has_filter {
-        let mut initial = run_index(k)?;
-        if initial.matched.len() >= k || initial.matched.len() >= total_live {
-            initial.matched.truncate(k);
+        let mut initial = run_index(target_k)?;
+        if initial.matched.len() >= target_k {
+            initial.matched.truncate(target_k);
             return Ok(initial.matched);
         }
     }
 
     let max_fetch_k = total_live.saturating_mul(16).max(4096);
-    let mut fetch_k = k.saturating_mul(4).max(64).min(max_fetch_k);
+    let mut fetch_k = target_k.saturating_mul(4).max(64).min(max_fetch_k);
     let mut prev_raw_count: Option<usize> = None;
 
     loop {
         let mut pass = run_index(fetch_k)?;
-        if pass.matched.len() >= k
+        if pass.matched.len() >= target_k
             || (!has_filter && pass.matched.len() >= total_live)
             || pass.raw_count >= total_live
         {
-            pass.matched.truncate(k);
+            pass.matched.truncate(target_k);
             return Ok(pass.matched);
         }
 
@@ -344,9 +369,57 @@ where
     fallback_scan()
 }
 
+fn validate_vector_for_metric(vector: &[f32], metric: DistanceMetric) -> Result<(), String> {
+    const MAX_L1_NORM: f64 = (f32::MAX as f64) * 0.25;
+    const MAX_SQUARED_NORM_EUCLIDEAN: f64 = (f32::MAX as f64) * 0.2;
+    const MAX_SQUARED_NORM_DOT_COSINE: f64 = (f32::MAX as f64) * 0.4;
+
+    match metric {
+        DistanceMetric::Manhattan => {
+            let mut l1 = 0.0f64;
+            for &x in vector {
+                l1 += (x as f64).abs();
+            }
+            if !l1.is_finite() || l1 > MAX_L1_NORM {
+                return Err(
+                    "Vector magnitude too large for finite f32 manhattan distance".to_string(),
+                );
+            }
+        }
+        DistanceMetric::Euclidean => {
+            let mut norm_sq = 0.0f64;
+            for &x in vector {
+                let xf = x as f64;
+                norm_sq += xf * xf;
+            }
+            if !norm_sq.is_finite() || norm_sq > MAX_SQUARED_NORM_EUCLIDEAN {
+                return Err(
+                    "Vector magnitude too large for finite f32 euclidean distance".to_string(),
+                );
+            }
+        }
+        DistanceMetric::Cosine | DistanceMetric::DotProduct => {
+            let mut norm_sq = 0.0f64;
+            for &x in vector {
+                let xf = x as f64;
+                norm_sq += xf * xf;
+            }
+            if !norm_sq.is_finite() || norm_sq > MAX_SQUARED_NORM_DOT_COSINE {
+                return Err(format!(
+                    "Vector magnitude too large for finite f32 {:?} distance",
+                    metric
+                ));
+            }
+        }
+    }
+
+    Ok(())
+}
+
 fn dedupe_batch_entries(
     entries_in: Vec<VectorEntry>,
     expected_dim: usize,
+    metric: DistanceMetric,
 ) -> Result<Vec<VectorEntry>, String> {
     for entry in &entries_in {
         if entry.vector.len() != expected_dim {
@@ -356,6 +429,7 @@ fn dedupe_batch_entries(
                 entry.vector.len()
             ));
         }
+        validate_vector_for_metric(&entry.vector, metric)?;
     }
 
     let mut last_idx_by_id = HashMap::with_capacity(entries_in.len());
@@ -382,57 +456,93 @@ fn dedupe_batch_entries(
 }
 
 enum DbBackend {
-    Persistent(VectorDB),
+    Persistent(VectorDB, Mutex<()>),
     InMemory(InMemoryDB),
 }
 
 impl DbBackend {
     fn insert(&self, entry: VectorEntry) -> Result<String, String> {
+        let expected_dim = self.options().dimensions;
+        if entry.vector.len() != expected_dim {
+            return Err(format!(
+                "Dimension mismatch: expected {}, actual {}",
+                expected_dim,
+                entry.vector.len()
+            ));
+        }
+        validate_vector_for_metric(&entry.vector, self.options().distance_metric)?;
+
         match self {
-            DbBackend::Persistent(db) => db.insert(entry).map_err(|e| e.to_string()),
+            DbBackend::Persistent(db, write_lock) => {
+                let _write_guard = write_lock.lock();
+                if db.options().hnsw_config.is_some() {
+                    if let Some(ref id) = entry.id {
+                        if db.get(id).map_err(|e| e.to_string())?.is_some() {
+                            let _ = db.delete(id).map_err(|e| e.to_string())?;
+                        }
+                    }
+                }
+                db.insert(entry).map_err(|e| e.to_string())
+            }
             DbBackend::InMemory(db) => db.insert(entry),
         }
     }
 
     fn insert_batch(&self, entries: Vec<VectorEntry>) -> Result<Vec<String>, String> {
-        let deduped = dedupe_batch_entries(entries, self.options().dimensions)?;
+        let opts = self.options();
+        let deduped = dedupe_batch_entries(entries, opts.dimensions, opts.distance_metric)?;
         match self {
-            DbBackend::Persistent(db) => db.insert_batch(deduped).map_err(|e| e.to_string()),
+            DbBackend::Persistent(db, write_lock) => {
+                let _write_guard = write_lock.lock();
+                if db.options().hnsw_config.is_some() {
+                    for entry in &deduped {
+                        if let Some(ref id) = entry.id {
+                            if db.get(id).map_err(|e| e.to_string())?.is_some() {
+                                let _ = db.delete(id).map_err(|e| e.to_string())?;
+                            }
+                        }
+                    }
+                }
+                db.insert_batch(deduped).map_err(|e| e.to_string())
+            }
             DbBackend::InMemory(db) => db.insert_batch(deduped),
         }
     }
 
     fn get(&self, id: &str) -> Result<Option<VectorEntry>, String> {
         match self {
-            DbBackend::Persistent(db) => db.get(id).map_err(|e| e.to_string()),
+            DbBackend::Persistent(db, _) => db.get(id).map_err(|e| e.to_string()),
             DbBackend::InMemory(db) => db.get(id),
         }
     }
 
     fn delete(&self, id: &str) -> Result<bool, String> {
         match self {
-            DbBackend::Persistent(db) => db.delete(id).map_err(|e| e.to_string()),
+            DbBackend::Persistent(db, write_lock) => {
+                let _write_guard = write_lock.lock();
+                db.delete(id).map_err(|e| e.to_string())
+            }
             DbBackend::InMemory(db) => db.delete(id),
         }
     }
 
     fn len(&self) -> Result<usize, String> {
         match self {
-            DbBackend::Persistent(db) => db.len().map_err(|e| e.to_string()),
+            DbBackend::Persistent(db, _) => db.len().map_err(|e| e.to_string()),
             DbBackend::InMemory(db) => db.len(),
         }
     }
 
     fn is_empty(&self) -> Result<bool, String> {
         match self {
-            DbBackend::Persistent(db) => db.is_empty().map_err(|e| e.to_string()),
+            DbBackend::Persistent(db, _) => db.is_empty().map_err(|e| e.to_string()),
             DbBackend::InMemory(db) => db.is_empty(),
         }
     }
 
     fn keys(&self) -> Result<Vec<String>, String> {
         match self {
-            DbBackend::Persistent(db) => db.keys().map_err(|e| e.to_string()),
+            DbBackend::Persistent(db, _) => db.keys().map_err(|e| e.to_string()),
             DbBackend::InMemory(db) => db.keys(),
         }
     }
@@ -440,7 +550,7 @@ impl DbBackend {
     fn search(&self, query: SearchQuery, hydrate: bool) -> Result<Vec<SearchResult>, String> {
         match self {
             DbBackend::InMemory(db) => db.search(&query, hydrate),
-            DbBackend::Persistent(db) => {
+            DbBackend::Persistent(db, _) => {
                 let expected_dim = db.options().dimensions;
                 if query.vector.len() != expected_dim {
                     return Err(format!(
@@ -449,6 +559,8 @@ impl DbBackend {
                         query.vector.len()
                     ));
                 }
+
+                validate_vector_for_metric(&query.vector, db.options().distance_metric)?;
 
                 if query.k == 0 {
                     return Ok(Vec::new());
@@ -535,7 +647,7 @@ impl DbBackend {
 
     fn options(&self) -> &DbOptions {
         match self {
-            DbBackend::Persistent(db) => db.options(),
+            DbBackend::Persistent(db, _) => db.options(),
             DbBackend::InMemory(db) => db.options(),
         }
     }
@@ -559,33 +671,54 @@ fn f64_eq_i128(f: f64, i: i128) -> bool {
 }
 
 fn json_values_equal(a: &serde_json::Value, b: &serde_json::Value) -> bool {
-    match (a, b) {
-        (serde_json::Value::Number(na), serde_json::Value::Number(nb)) => {
-            match (json_number_as_i128(na), json_number_as_i128(nb)) {
-                (Some(ia), Some(ib)) => ia == ib,
-                (Some(i), None) => nb.as_f64().is_some_and(|f| f64_eq_i128(f, i)),
-                (None, Some(i)) => na.as_f64().is_some_and(|f| f64_eq_i128(f, i)),
-                (None, None) => match (na.as_f64(), nb.as_f64()) {
-                    (Some(fa), Some(fb)) => fa == fb,
-                    _ => false,
-                },
+    let mut stack = vec![(a, b, 1usize)];
+
+    while let Some((va, vb, depth)) = stack.pop() {
+        match (va, vb) {
+            (serde_json::Value::Number(na), serde_json::Value::Number(nb)) => {
+                let eq = match (json_number_as_i128(na), json_number_as_i128(nb)) {
+                    (Some(ia), Some(ib)) => ia == ib,
+                    (Some(i), None) => nb.as_f64().is_some_and(|f| f64_eq_i128(f, i)),
+                    (None, Some(i)) => na.as_f64().is_some_and(|f| f64_eq_i128(f, i)),
+                    (None, None) => match (na.as_f64(), nb.as_f64()) {
+                        (Some(fa), Some(fb)) => fa == fb,
+                        _ => false,
+                    },
+                };
+                if !eq {
+                    return false;
+                }
+            }
+            (serde_json::Value::Array(aa), serde_json::Value::Array(ab)) => {
+                let next_depth = depth + 1;
+                if next_depth > MAX_JSON_DEPTH || aa.len() != ab.len() {
+                    return false;
+                }
+                for (xa, xb) in aa.iter().zip(ab.iter()) {
+                    stack.push((xa, xb, next_depth));
+                }
+            }
+            (serde_json::Value::Object(oa), serde_json::Value::Object(ob)) => {
+                let next_depth = depth + 1;
+                if next_depth > MAX_JSON_DEPTH || oa.len() != ob.len() {
+                    return false;
+                }
+                for (k_str, xa) in oa {
+                    let Some(xb) = ob.get(k_str) else {
+                        return false;
+                    };
+                    stack.push((xa, xb, next_depth));
+                }
+            }
+            _ => {
+                if va != vb {
+                    return false;
+                }
             }
         }
-        (serde_json::Value::Array(aa), serde_json::Value::Array(ab)) => {
-            aa.len() == ab.len()
-                && aa
-                    .iter()
-                    .zip(ab.iter())
-                    .all(|(xa, xb)| json_values_equal(xa, xb))
-        }
-        (serde_json::Value::Object(oa), serde_json::Value::Object(ob)) => {
-            oa.len() == ob.len()
-                && oa
-                    .iter()
-                    .all(|(k_str, va)| ob.get(k_str).is_some_and(|vb| json_values_equal(va, vb)))
-        }
-        _ => a == b,
     }
+
+    true
 }
 
 fn matches_filter(
@@ -714,10 +847,24 @@ fn decode_map_key(term: Term) -> Result<String, rustler::Error> {
         } else {
             Ok(name)
         }
-    } else if let Ok(i) = term.decode::<i64>() {
-        Ok(i.to_string())
-    } else if let Ok(u) = term.decode::<u64>() {
-        Ok(u.to_string())
+    } else {
+        Err(rustler::Error::BadArg)
+    }
+}
+
+fn decode_proper_list<'a>(term: Term<'a>) -> Result<Vec<Term<'a>>, rustler::Error> {
+    let len = term.list_length()?;
+    let mut items = Vec::with_capacity(len);
+    let mut current = term;
+
+    for _ in 0..len {
+        let (head, tail) = current.list_get_cell()?;
+        items.push(head);
+        current = tail;
+    }
+
+    if current.is_empty_list() {
+        Ok(items)
     } else {
         Err(rustler::Error::BadArg)
     }
@@ -739,7 +886,7 @@ fn map_term_to_json_map(
             return Err(rustler::Error::BadArg);
         }
         let key = decode_map_key(k_term)?;
-        let val = term_to_json_depth(v_term, depth + 1)?;
+        let val = term_to_json_depth(v_term, depth)?;
         if map.insert(key, val).is_some() {
             return Err(rustler::Error::BadArg);
         }
@@ -748,17 +895,9 @@ fn map_term_to_json_map(
     Ok(map)
 }
 
-fn term_to_json(term: Term) -> Result<serde_json::Value, rustler::Error> {
-    term_to_json_depth(term, 0)
-}
-
 // Strictly convert a supported Elixir term into a serde_json::Value with a
-// recursion depth cap to prevent OS scheduler-thread stack overflow.
+// container recursion depth cap to prevent OS scheduler-thread stack overflow.
 fn term_to_json_depth(term: Term, depth: usize) -> Result<serde_json::Value, rustler::Error> {
-    if depth > MAX_JSON_DEPTH {
-        return Err(rustler::Error::BadArg);
-    }
-
     if rustler::types::atom::nil() == term {
         return Ok(serde_json::Value::Null);
     }
@@ -787,21 +926,29 @@ fn term_to_json_depth(term: Term, depth: usize) -> Result<serde_json::Value, rus
         return Ok(serde_json::Value::String(name));
     }
     if term.is_list() {
-        let list = term.decode::<Vec<Term>>()?;
+        let next_depth = depth + 1;
+        if next_depth > MAX_JSON_DEPTH {
+            return Err(rustler::Error::BadArg);
+        }
+        let list = decode_proper_list(term)?;
         let mut values = Vec::with_capacity(list.len());
         for item in list {
-            values.push(term_to_json_depth(item, depth + 1)?);
+            values.push(term_to_json_depth(item, next_depth)?);
         }
         return Ok(serde_json::Value::Array(values));
     }
     if let Some(map_iter) = rustler::types::map::MapIterator::new(term) {
+        let next_depth = depth + 1;
+        if next_depth > MAX_JSON_DEPTH {
+            return Err(rustler::Error::BadArg);
+        }
         let mut map = serde_json::Map::new();
         for (k_term, v_term) in map_iter {
             if rustler::types::atom::__struct__() == k_term {
                 return Err(rustler::Error::BadArg);
             }
             let key = decode_map_key(k_term)?;
-            let val = term_to_json_depth(v_term, depth + 1)?;
+            let val = term_to_json_depth(v_term, next_depth)?;
             if map.insert(key, val).is_some() {
                 return Err(rustler::Error::BadArg);
             }
@@ -813,10 +960,6 @@ fn term_to_json_depth(term: Term, depth: usize) -> Result<serde_json::Value, rus
 }
 
 fn json_to_term<'a>(env: Env<'a>, val: &serde_json::Value, depth: usize) -> NifResult<Term<'a>> {
-    if depth > MAX_JSON_DEPTH {
-        return Err(rustler::Error::BadArg);
-    }
-
     match val {
         serde_json::Value::Null => Ok(rustler::types::atom::nil().encode(env)),
         serde_json::Value::Bool(b) => Ok(b.encode(env)),
@@ -837,18 +980,26 @@ fn json_to_term<'a>(env: Env<'a>, val: &serde_json::Value, depth: usize) -> NifR
         }
         serde_json::Value::String(s) => Ok(s.encode(env)),
         serde_json::Value::Array(arr) => {
+            let next_depth = depth + 1;
+            if next_depth > MAX_JSON_DEPTH {
+                return Err(rustler::Error::BadArg);
+            }
             let mut terms = Vec::with_capacity(arr.len());
             for v in arr {
-                terms.push(json_to_term(env, v, depth + 1)?);
+                terms.push(json_to_term(env, v, next_depth)?);
             }
             Ok(terms.encode(env))
         }
         serde_json::Value::Object(obj) => {
+            let next_depth = depth + 1;
+            if next_depth > MAX_JSON_DEPTH {
+                return Err(rustler::Error::BadArg);
+            }
             let mut keys = Vec::with_capacity(obj.len());
             let mut vals = Vec::with_capacity(obj.len());
             for (k_str, v) in obj {
                 keys.push(k_str.encode(env));
-                vals.push(json_to_term(env, v, depth + 1)?);
+                vals.push(json_to_term(env, v, next_depth)?);
             }
             Term::map_from_term_arrays(env, &keys, &vals)
         }
@@ -873,13 +1024,36 @@ fn metadata_to_term<'a>(
     }
 }
 
-fn decode_finite_f32_vec(term: Term) -> Result<Vec<f32>, rustler::Error> {
-    let vec = term.decode::<Vec<f32>>()?;
-    if vec.iter().all(|x| x.is_finite()) {
-        Ok(vec)
+fn decode_finite_f32(term: Term) -> Result<f32, rustler::Error> {
+    let val: f64 = if term.is_float() {
+        term.decode::<f64>()?
+    } else if let Ok(i) = term.decode::<i64>() {
+        i as f64
+    } else if let Ok(u) = term.decode::<u64>() {
+        u as f64
+    } else if let Ok(i) = term.decode::<i128>() {
+        i as f64
+    } else if let Ok(u) = term.decode::<u128>() {
+        u as f64
+    } else {
+        return Err(rustler::Error::BadArg);
+    };
+
+    let f = val as f32;
+    if f.is_finite() {
+        Ok(f)
     } else {
         Err(rustler::Error::BadArg)
     }
+}
+
+fn decode_finite_f32_vec(term: Term) -> Result<Vec<f32>, rustler::Error> {
+    let items = decode_proper_list(term)?;
+    let mut vec = Vec::with_capacity(items.len());
+    for item in items {
+        vec.push(decode_finite_f32(item)?);
+    }
+    Ok(vec)
 }
 
 fn decode_id(term: Term) -> Result<String, rustler::Error> {
@@ -1145,20 +1319,67 @@ fn parse_hnsw(term: Term) -> Result<Option<HnswConfig>, String> {
     if let Some(hnsw_map) = rustler::types::map::MapIterator::new(term) {
         let mut cfg = HnswConfig::default();
         let mut count = 0usize;
+        let mut seen_m = false;
+        let mut seen_ef_construction = false;
+        let mut seen_ef_search = false;
+        let mut seen_max_elements = false;
         for (hk, hv) in hnsw_map {
             count += 1;
             let hkey = decode_map_key(hk).map_err(|_| "Invalid key in :hnsw option".to_string())?;
             match hkey.as_str() {
                 "m" => {
+                    if seen_m {
+                        return Err("Duplicate :m in :hnsw option".to_string());
+                    }
+                    seen_m = true;
                     let val = decode_pos_usize(hv, "m")?;
                     if !(2..=256).contains(&val) {
                         return Err(format!("Option :m must be between 2 and 256, got: {}", val));
                     }
                     cfg.m = val;
                 }
-                "ef_construction" => cfg.ef_construction = decode_pos_usize(hv, "ef_construction")?,
-                "ef_search" => cfg.ef_search = decode_pos_usize(hv, "ef_search")?,
-                "max_elements" => cfg.max_elements = decode_pos_usize(hv, "max_elements")?,
+                "ef_construction" => {
+                    if seen_ef_construction {
+                        return Err("Duplicate :ef_construction in :hnsw option".to_string());
+                    }
+                    seen_ef_construction = true;
+                    let val = decode_pos_usize(hv, "ef_construction")?;
+                    if val > MAX_HNSW_EF {
+                        return Err(format!(
+                            "Option :ef_construction must be between 1 and {}, got: {}",
+                            MAX_HNSW_EF, val
+                        ));
+                    }
+                    cfg.ef_construction = val;
+                }
+                "ef_search" => {
+                    if seen_ef_search {
+                        return Err("Duplicate :ef_search in :hnsw option".to_string());
+                    }
+                    seen_ef_search = true;
+                    let val = decode_pos_usize(hv, "ef_search")?;
+                    if val > MAX_HNSW_EF {
+                        return Err(format!(
+                            "Option :ef_search must be between 1 and {}, got: {}",
+                            MAX_HNSW_EF, val
+                        ));
+                    }
+                    cfg.ef_search = val;
+                }
+                "max_elements" => {
+                    if seen_max_elements {
+                        return Err("Duplicate :max_elements in :hnsw option".to_string());
+                    }
+                    seen_max_elements = true;
+                    let val = decode_pos_usize(hv, "max_elements")?;
+                    if val > MAX_HNSW_MAX_ELEMENTS {
+                        return Err(format!(
+                            "Option :max_elements must be between 1 and {}, got: {}",
+                            MAX_HNSW_MAX_ELEMENTS, val
+                        ));
+                    }
+                    cfg.max_elements = val;
+                }
                 other => return Err(format!("Unknown :hnsw option key: {}", other)),
             }
         }
@@ -1185,6 +1406,8 @@ fn parse_db_options(
 
     let mut distance_metric = DistanceMetric::Cosine;
     let mut seen_metric = false;
+    let mut seen_hnsw = false;
+    let mut seen_quantization = false;
     let mut hnsw_config = None;
     let mut quantization = None;
 
@@ -1207,9 +1430,17 @@ fn parse_db_options(
                         distance_metric = parse_metric(v_term)?;
                     }
                     "hnsw" => {
+                        if seen_hnsw {
+                            return Err("Duplicate :hnsw option".to_string());
+                        }
+                        seen_hnsw = true;
                         hnsw_config = parse_hnsw(v_term)?;
                     }
                     "quantization" => {
+                        if seen_quantization {
+                            return Err("Duplicate :quantization option".to_string());
+                        }
+                        seen_quantization = true;
                         quantization = parse_quantization(v_term, dimensions)?;
                     }
                     other => {
@@ -1252,7 +1483,7 @@ fn open_db_with_options<'a>(
         InMemoryDB::new(opts).map(DbBackend::InMemory)
     } else {
         VectorDB::new(opts)
-            .map(DbBackend::Persistent)
+            .map(|db| DbBackend::Persistent(db, Mutex::new(())))
             .map_err(|e| e.to_string())
     };
 
@@ -1297,7 +1528,7 @@ fn insert_batch<'a>(
     db_ref: ResourceArc<DbResource>,
     entries_term: Term<'a>,
 ) -> NifResult<Term<'a>> {
-    let Ok(entries_list) = entries_term.decode::<Vec<Term<'a>>>() else {
+    let Ok(entries_list) = decode_proper_list(entries_term) else {
         return Ok((error(), "Vector batch must be a list").encode(env));
     };
 
@@ -1328,10 +1559,17 @@ fn get_entry<'a>(
 
     match with_db(&db_ref, |db| db.get(&id_str)) {
         Ok(Some(entry)) => {
-            if !entry.vector.iter().all(|x| x.is_finite()) {
-                return Ok((error(), "Stored vector contains non-finite float").encode(env));
-            }
             let entry_id = entry.id.as_deref().unwrap_or(&id_str);
+            if !entry.vector.iter().all(|x| x.is_finite()) {
+                return Ok((
+                    error(),
+                    format!(
+                        "Stored vector contains non-finite float for id '{}'",
+                        entry_id
+                    ),
+                )
+                    .encode(env));
+            }
             let meta_term = match metadata_to_term(env, entry.metadata.as_ref()) {
                 Ok(t) => t,
                 Err(msg) => return Ok((error(), msg).encode(env)),
@@ -1416,13 +1654,14 @@ fn extract_filter<'a>(
     }
 
     if f_term.is_list() {
-        let list = f_term.decode::<Vec<(Term, Term)>>()?;
-        if list.is_empty() {
+        let raw_list = decode_proper_list(f_term)?;
+        if raw_list.is_empty() {
             return Ok(None);
         }
-        let mut map = HashMap::with_capacity(list.len());
-        let mut key_kinds: HashMap<String, FilterKeyKind> = HashMap::with_capacity(list.len());
-        for (k_term, v_term) in list {
+        let mut map = HashMap::with_capacity(raw_list.len());
+        let mut key_kinds: HashMap<String, FilterKeyKind> = HashMap::with_capacity(raw_list.len());
+        for item in raw_list {
+            let (k_term, v_term) = item.decode::<(Term, Term)>()?;
             let (key, kind) = if let Ok(s) = k_term.decode::<String>() {
                 (s, FilterKeyKind::String)
             } else if is_nil_or_bool(k_term) {
@@ -1442,7 +1681,7 @@ fn extract_filter<'a>(
             } else {
                 key_kinds.insert(key.clone(), kind);
             }
-            let val = term_to_json(v_term)?;
+            let val = term_to_json_depth(v_term, 1)?;
             // Match Elixir Keyword first-key-wins semantics on duplicate same-kind keys.
             map.entry(key).or_insert(val);
         }
@@ -1494,8 +1733,12 @@ fn search<'a>(
 
     match with_db(&db_ref, |db| db.search(query, false)) {
         Ok(results) => {
-            if results.iter().any(|r| !r.score.is_finite()) {
-                return Ok((error(), "Search produced non-finite score").encode(env));
+            if let Some(bad) = results.iter().find(|r| !r.score.is_finite()) {
+                return Ok((
+                    error(),
+                    format!("Search produced non-finite score for id '{}'", bad.id),
+                )
+                    .encode(env));
             }
             let ids: Vec<String> = results.into_iter().map(|r| r.id).collect();
             Ok((ok(), ids).encode(env))
@@ -1523,14 +1766,23 @@ fn search_detailed<'a>(
             let mut terms = Vec::with_capacity(results.len());
             for r in results {
                 if !r.score.is_finite() {
-                    return Ok((error(), "Search produced non-finite score").encode(env));
+                    return Ok((
+                        error(),
+                        format!("Search produced non-finite score for id '{}'", r.id),
+                    )
+                        .encode(env));
                 }
                 let vec_term = match r.vector {
                     Some(v) => {
                         if !v.iter().all(|x| x.is_finite()) {
-                            return Ok(
-                                (error(), "Stored vector contains non-finite float").encode(env)
-                            );
+                            return Ok((
+                                error(),
+                                format!(
+                                    "Stored vector contains non-finite float for id '{}'",
+                                    r.id
+                                ),
+                            )
+                                .encode(env));
                         }
                         v.encode(env)
                     }
