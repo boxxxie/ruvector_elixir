@@ -1698,6 +1698,7 @@ dependencies = [
 name = "ruvector_nif"
 version = "0.1.0"
 dependencies = [
+ "parking_lot",
  "rustler",
  "ruvector-core",
  "serde",

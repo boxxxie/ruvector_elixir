@@ -238,5 +238,44 @@ defmodule RuvectorElixir.ConcurrencyTest do
         assert :ok = RuvectorElixir.close(db)
       end
     end
+
+    test "close/1 completes promptly under continuous DirtyCpu search load", %{tmp_dir: tmp_dir} do
+      db_path = Path.join(tmp_dir, "rwlock_fairness.rvf")
+
+      assert {:ok, db} =
+               RuvectorElixir.open(db_path, 16, hnsw: [m: 16, ef_search: 64, max_elements: 1_000])
+
+      entries =
+        for i <- 0..199 do
+          %{id: "f_#{i}", vector: for(j <- 0..15, do: (i + j) * 0.01)}
+        end
+
+      assert {:ok, _} = RuvectorElixir.insert_batch(db, entries)
+
+      query = List.duplicate(0.5, 16)
+      parent = self()
+
+      searchers =
+        for _ <- 1..6 do
+          Task.async(fn ->
+            send(parent, :searcher_started)
+
+            Enum.reduce_while(1..500, :ok, fn _, _acc ->
+              case RuvectorElixir.search(db, query, 10) do
+                {:ok, _ids} -> {:cont, :ok}
+                {:error, :closed} -> {:halt, :closed}
+              end
+            end)
+          end)
+        end
+
+      for _ <- 1..6 do
+        assert_receive :searcher_started, 2_000
+      end
+
+      assert :ok = RuvectorElixir.close(db)
+      results = Task.await_many(searchers, 5_000)
+      assert Enum.all?(results, &(&1 in [:ok, :closed]))
+    end
   end
 end

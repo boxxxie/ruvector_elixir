@@ -33,9 +33,18 @@ defmodule RuvectorElixir.Native do
   @spec all_ids(reference()) :: {:ok, [String.t()]} | {:error, :closed | String.t()}
   def all_ids(_db_ref), do: :erlang.nif_error(:nif_not_loaded)
 
-  @spec search(reference(), [number()], map() | keyword() | nil, non_neg_integer()) ::
+  @spec search(
+          reference(),
+          [number()],
+          map() | keyword() | nil,
+          non_neg_integer(),
+          pos_integer() | nil
+        ) ::
           {:ok, [String.t()]} | {:error, :closed | String.t()}
-  def search(_db_ref, _query_vector, _filter, _k), do: :erlang.nif_error(:nif_not_loaded)
+  def search(db_ref, query_vector, filter, k, ef_search \\ nil)
+
+  def search(_db_ref, _query_vector, _filter, _k, _ef_search),
+    do: :erlang.nif_error(:nif_not_loaded)
 
   @spec search_detailed(
           reference(),

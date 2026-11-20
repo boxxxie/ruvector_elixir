@@ -289,6 +289,16 @@ defmodule RuvectorElixir.EdgeCasesTest do
         RuvectorElixir.search(db, [1.0, 0.0, 0.0, 0.0], 5, filter: ~D[2026-01-01])
       end
 
+      assert {:error, "Invalid filter format"} =
+               RuvectorElixir.search(db, [1.0, 0.0, 0.0, 0.0], 5,
+                 filter: [{"tenant", "a"}, {:tenant, "b"}]
+               )
+
+      assert {:error, "Invalid filter format"} =
+               RuvectorElixir.search(db, [1.0, 0.0, 0.0, 0.0], 5,
+                 filter: %{"tenant" => "a", :tenant => "b"}
+               )
+
       # Unsupported values inside an otherwise valid filter map return an error from NIF
       assert {:error, "Invalid filter format"} =
                RuvectorElixir.search(db, [1.0, 0.0, 0.0, 0.0], 5, filter: %{"bad" => {:tuple}})
@@ -468,6 +478,151 @@ defmodule RuvectorElixir.EdgeCasesTest do
       entry = VectorEntry.from_map(%{id: 42, vector: [1.0, 2.0], metadata: nil})
       assert entry.id == "42"
       assert entry.vector == [1.0, 2.0]
+    end
+
+    test "HNSW search recovers live vectors past tombstones and selective filters", %{
+      tmp_dir: tmp_dir
+    } do
+      targets = [
+        {"memory://hnsw_tombstones", [metric: :euclidean, hnsw: [m: 16, ef_search: 16]]},
+        {Path.join(tmp_dir, "hnsw_tombstones.rvf"),
+         [metric: :euclidean, hnsw: [m: 16, ef_search: 16]]}
+      ]
+
+      for {path, opts} <- targets do
+        assert {:ok, db} = RuvectorElixir.open(path, 4, opts)
+
+        entries =
+          for i <- 0..99 do
+            x = if i < 90, do: i * 0.001, else: 10.0 + (i - 90) * 0.1
+
+            %{
+              id: "v_#{i}",
+              vector: [x, 0.0, 0.0, 0.0],
+              metadata: %{"keep" => i >= 90, "rare" => i in [95, 98]}
+            }
+          end
+
+        assert {:ok, _} = RuvectorElixir.insert_batch(db, entries)
+
+        for i <- 0..89 do
+          assert {:ok, true} = RuvectorElixir.delete(db, "v_#{i}")
+        end
+
+        assert {:ok, 10} = RuvectorElixir.len(db)
+
+        assert {:ok, top5} = RuvectorElixir.search(db, [0.0, 0.0, 0.0, 0.0], 5)
+        assert top5 == ["v_90", "v_91", "v_92", "v_93", "v_94"]
+
+        assert {:ok, all_live} = RuvectorElixir.search(db, [0.0, 0.0, 0.0, 0.0], 10)
+        assert length(all_live) == 10
+        assert hd(all_live) == "v_90"
+
+        assert {:ok, filtered} =
+                 RuvectorElixir.search_detailed(db, [0.0, 0.0, 0.0, 0.0], 5,
+                   filter: %{"keep" => true},
+                   ef_search: 8
+                 )
+
+        assert Enum.map(filtered, & &1.id) == ["v_90", "v_91", "v_92", "v_93", "v_94"]
+
+        assert {:ok, rare} =
+                 RuvectorElixir.search(db, [0.0, 0.0, 0.0, 0.0], 5, filter: %{"rare" => true})
+
+        assert rare == ["v_95", "v_98"]
+
+        assert :ok = RuvectorElixir.close(db)
+      end
+    end
+
+    test "insert_batch deduplicates intra-batch duplicate IDs without ghost search results", %{
+      tmp_dir: tmp_dir
+    } do
+      targets = [
+        {"memory://dedupe_flat", [metric: :euclidean, hnsw: false]},
+        {"memory://dedupe_hnsw", [metric: :euclidean, hnsw: [m: 16, ef_search: 32]]},
+        {Path.join(tmp_dir, "dedupe_flat.rvf"), [metric: :euclidean, hnsw: false]},
+        {Path.join(tmp_dir, "dedupe_hnsw.rvf"),
+         [metric: :euclidean, hnsw: [m: 16, ef_search: 32]]}
+      ]
+
+      v1 = [1.0, 0.0, 0.0, 0.0]
+      v2 = [0.0, 0.0, 1.0, 0.0]
+      v_other = [0.0, 1.0, 0.0, 0.0]
+
+      for {path, opts} <- targets do
+        assert {:ok, db} = RuvectorElixir.open(path, 4, opts)
+
+        assert {:error, reason} =
+                 RuvectorElixir.insert_batch(db, [
+                   %{id: "dup", vector: [1.0, 2.0]},
+                   %{id: "dup", vector: v2}
+                 ])
+
+        assert String.contains?(reason, "Dimension") or String.contains?(reason, "mismatch")
+
+        assert {:ok, ["other", "dup"]} =
+                 RuvectorElixir.insert_batch(db, [
+                   %{id: "dup", vector: v1, metadata: %{"rev" => 1}},
+                   %{id: "other", vector: v_other, metadata: %{"rev" => 0}},
+                   %{id: "dup", vector: v2, metadata: %{"rev" => 2}}
+                 ])
+
+        assert {:ok, 2} = RuvectorElixir.len(db)
+        assert {:ok, fetched} = RuvectorElixir.get(db, "dup")
+        assert fetched.vector == v2
+        assert fetched.metadata == %{"rev" => 2}
+
+        assert {:ok, ids} = RuvectorElixir.search(db, v1, 5)
+        assert Enum.sort(ids) == ["dup", "other"]
+        assert Enum.count(ids, &(&1 == "dup")) == 1
+
+        assert {:ok, detailed} = RuvectorElixir.search_detailed(db, v1, 5)
+        dup_res = Enum.find(detailed, &(&1.id == "dup"))
+        assert dup_res.vector == v2
+        assert dup_res.metadata == %{"rev" => 2}
+        assert_in_delta dup_res.score, :math.sqrt(2.0), 0.01
+
+        assert {:ok, true} = RuvectorElixir.delete(db, "dup")
+        assert {:ok, 1} = RuvectorElixir.len(db)
+        assert {:ok, ["other"]} = RuvectorElixir.search(db, v1, 5)
+
+        assert :ok = RuvectorElixir.close(db)
+      end
+    end
+
+    test "GC reaper releases unclosed persistent DB handles safely", %{tmp_dir: tmp_dir} do
+      gc_path = Path.join(tmp_dir, "gc_reaper.rvf")
+
+      task =
+        Task.async(fn ->
+          {:ok, leaked_db} = RuvectorElixir.open(gc_path, 4)
+          {:ok, _} = RuvectorElixir.insert(leaked_db, %{id: "gc1", vector: [1.0, 0.0, 0.0, 0.0]})
+          :ok
+        end)
+
+      assert :ok = Task.await(task)
+      :erlang.garbage_collect()
+
+      assert {:ok, entry} = reopen_eventually(gc_path, 4, 25)
+      assert entry.id == "gc1"
+    end
+  end
+
+  defp reopen_eventually(path, dims, attempts_left) do
+    case RuvectorElixir.open(path, dims) do
+      {:ok, db} ->
+        res = RuvectorElixir.get(db, "gc1")
+        :ok = RuvectorElixir.close(db)
+        res
+
+      {:error, _reason} when attempts_left > 1 ->
+        Process.sleep(20)
+        :erlang.garbage_collect()
+        reopen_eventually(path, dims, attempts_left - 1)
+
+      other ->
+        other
     end
   end
 end

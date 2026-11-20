@@ -1,4 +1,6 @@
+use parking_lot::RwLock;
 use rustler::{Encoder, Env, NifResult, ResourceArc, Term};
+use ruvector_core::distance::distance;
 use ruvector_core::index::flat::FlatIndex;
 use ruvector_core::index::hnsw::HnswIndex;
 use ruvector_core::index::VectorIndex;
@@ -7,8 +9,8 @@ use ruvector_core::types::{
     VectorEntry,
 };
 use ruvector_core::VectorDB;
-use std::collections::HashMap;
-use std::sync::RwLock;
+use std::collections::{HashMap, HashSet};
+use std::sync::{mpsc, OnceLock};
 
 const MAX_JSON_DEPTH: usize = 128;
 
@@ -100,10 +102,7 @@ impl InMemoryDB {
         entry.id = Some(id.clone());
         let vec_for_index = entry.vector.clone();
 
-        let mut state = self
-            .state
-            .write()
-            .map_err(|_| "In-memory database lock poisoned".to_string())?;
+        let mut state = self.state.write();
 
         if state.entries.contains_key(&id) {
             let _ = state.index.remove(&id)?;
@@ -116,16 +115,6 @@ impl InMemoryDB {
     }
 
     fn insert_batch(&self, entries_in: Vec<VectorEntry>) -> Result<Vec<String>, String> {
-        for entry in &entries_in {
-            if entry.vector.len() != self.options.dimensions {
-                return Err(format!(
-                    "Dimension mismatch: expected {}, actual {}",
-                    self.options.dimensions,
-                    entry.vector.len()
-                ));
-            }
-        }
-
         let mut prepared = Vec::with_capacity(entries_in.len());
         let mut ids = Vec::with_capacity(entries_in.len());
         let mut index_entries = Vec::with_capacity(entries_in.len());
@@ -141,10 +130,7 @@ impl InMemoryDB {
             prepared.push((id, entry));
         }
 
-        let mut state = self
-            .state
-            .write()
-            .map_err(|_| "In-memory database lock poisoned".to_string())?;
+        let mut state = self.state.write();
 
         for (id, _) in &prepared {
             if state.entries.contains_key(id) {
@@ -161,18 +147,12 @@ impl InMemoryDB {
     }
 
     fn get(&self, id: &str) -> Result<Option<VectorEntry>, String> {
-        let state = self
-            .state
-            .read()
-            .map_err(|_| "In-memory database lock poisoned".to_string())?;
+        let state = self.state.read();
         Ok(state.entries.get(id).cloned())
     }
 
     fn delete(&self, id: &str) -> Result<bool, String> {
-        let mut state = self
-            .state
-            .write()
-            .map_err(|_| "In-memory database lock poisoned".to_string())?;
+        let mut state = self.state.write();
 
         let removed = state.entries.remove(id).is_some();
         if removed {
@@ -182,27 +162,15 @@ impl InMemoryDB {
     }
 
     fn len(&self) -> Result<usize, String> {
-        let state = self
-            .state
-            .read()
-            .map_err(|_| "In-memory database lock poisoned".to_string())?;
-        Ok(state.entries.len())
+        Ok(self.state.read().entries.len())
     }
 
     fn is_empty(&self) -> Result<bool, String> {
-        let state = self
-            .state
-            .read()
-            .map_err(|_| "In-memory database lock poisoned".to_string())?;
-        Ok(state.entries.is_empty())
+        Ok(self.state.read().entries.is_empty())
     }
 
     fn keys(&self) -> Result<Vec<String>, String> {
-        let state = self
-            .state
-            .read()
-            .map_err(|_| "In-memory database lock poisoned".to_string())?;
-        Ok(state.entries.keys().cloned().collect())
+        Ok(self.state.read().entries.keys().cloned().collect())
     }
 
     fn search(&self, query: &SearchQuery, hydrate: bool) -> Result<Vec<SearchResult>, String> {
@@ -218,76 +186,71 @@ impl InMemoryDB {
             return Ok(Vec::new());
         }
 
-        let state = self
-            .state
-            .read()
-            .map_err(|_| "In-memory database lock poisoned".to_string())?;
+        let state = self.state.read();
+        let total_live = state.entries.len();
 
-        let total = state.entries.len();
-        if total == 0 {
-            return Ok(Vec::new());
-        }
+        search_with_fallback(
+            query.k,
+            total_live,
+            self.options.hnsw_config.is_some(),
+            query.filter.is_some(),
+            |fetch_k| {
+                let effective_ef = query.ef_search.map(|ef| ef.max(fetch_k));
+                let candidates = state.index.search(&query.vector, fetch_k, effective_ef)?;
+                let mut seen_ids = HashSet::with_capacity(candidates.len());
+                let mut live_count = 0usize;
+                let mut matched = Vec::new();
 
-        let hydrate_results = |candidates: Vec<SearchResult>| -> Vec<SearchResult> {
-            candidates
-                .into_iter()
-                .map(|mut r| {
-                    if hydrate {
-                        if let Some(entry) = state.entries.get(&r.id) {
-                            r.vector = Some(entry.vector.clone());
-                            r.metadata = entry.metadata.clone();
+                for mut r in candidates {
+                    let Some(entry) = state.entries.get(&r.id) else {
+                        continue;
+                    };
+                    if !seen_ids.insert(r.id.clone()) {
+                        continue;
+                    }
+                    live_count += 1;
+                    if let Some(filter) = &query.filter {
+                        if !matches_filter(entry.metadata.as_ref(), filter) {
+                            continue;
                         }
                     }
-                    r
-                })
-                .collect()
-        };
-
-        let Some(filter) = &query.filter else {
-            let mut results = state
-                .index
-                .search(&query.vector, query.k, query.ef_search)?;
-            if results.len() < query.k
-                && self.options.hnsw_config.is_some()
-                && total > results.len()
-            {
-                let mut fetch_k = query.k.saturating_mul(4).max(64).min(total);
-                loop {
-                    let mut widened =
-                        state
-                            .index
-                            .search(&query.vector, fetch_k, query.ef_search)?;
-                    if widened.len() >= query.k || fetch_k >= total {
-                        widened.truncate(query.k);
-                        results = widened;
-                        break;
+                    if hydrate {
+                        r.vector = Some(entry.vector.clone());
+                        r.metadata = entry.metadata.clone();
                     }
-                    fetch_k = next_fetch_k(fetch_k, total);
+                    matched.push(r);
                 }
-            }
-            return Ok(hydrate_results(results));
-        };
 
-        let mut fetch_k = query.k.saturating_mul(4).max(64).min(total);
-        loop {
-            let candidates = state
-                .index
-                .search(&query.vector, fetch_k, query.ef_search)?;
-            let mut matched: Vec<SearchResult> = candidates
-                .into_iter()
-                .filter(|r| {
-                    let meta = state.entries.get(&r.id).and_then(|e| e.metadata.as_ref());
-                    matches_filter(meta, filter)
+                Ok(IndexPass {
+                    raw_count: live_count,
+                    matched,
                 })
-                .collect();
-
-            if matched.len() >= query.k || fetch_k >= total {
-                matched.truncate(query.k);
-                return Ok(hydrate_results(matched));
-            }
-
-            fetch_k = next_fetch_k(fetch_k, total);
-        }
+            },
+            || {
+                let mut results = Vec::new();
+                for (id, entry) in &state.entries {
+                    if let Some(filter) = &query.filter {
+                        if !matches_filter(entry.metadata.as_ref(), filter) {
+                            continue;
+                        }
+                    }
+                    let score =
+                        distance(&query.vector, &entry.vector, self.options.distance_metric)
+                            .map_err(|e| e.to_string())?;
+                    results.push(SearchResult {
+                        id: id.clone(),
+                        score,
+                        vector: hydrate.then(|| entry.vector.clone()),
+                        metadata: if hydrate {
+                            entry.metadata.clone()
+                        } else {
+                            None
+                        },
+                    });
+                }
+                Ok(finalize_fallback_scan(results, query.k))
+            },
+        )
     }
 
     fn options(&self) -> &DbOptions {
@@ -295,12 +258,127 @@ impl InMemoryDB {
     }
 }
 
-fn next_fetch_k(current: usize, total: usize) -> usize {
-    if current >= total / 4 {
-        total
-    } else {
-        current.saturating_mul(2).min(total)
+struct IndexPass {
+    raw_count: usize,
+    matched: Vec<SearchResult>,
+}
+
+fn finalize_fallback_scan(mut results: Vec<SearchResult>, k: usize) -> Vec<SearchResult> {
+    results.sort_unstable_by(|a, b| {
+        a.score
+            .partial_cmp(&b.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    results.truncate(k);
+    results
+}
+
+fn search_with_fallback<F, G>(
+    k: usize,
+    total_live: usize,
+    has_hnsw: bool,
+    has_filter: bool,
+    mut run_index: F,
+    fallback_scan: G,
+) -> Result<Vec<SearchResult>, String>
+where
+    F: FnMut(usize) -> Result<IndexPass, String>,
+    G: FnOnce() -> Result<Vec<SearchResult>, String>,
+{
+    if k == 0 || total_live == 0 {
+        return Ok(Vec::new());
     }
+
+    if !has_hnsw {
+        if !has_filter {
+            let mut pass = run_index(k)?;
+            if pass.matched.len() >= k || pass.matched.len() >= total_live {
+                pass.matched.truncate(k);
+                return Ok(pass.matched);
+            }
+            return fallback_scan();
+        }
+
+        let initial_k = k.saturating_mul(4).max(64).min(total_live);
+        let mut pass = run_index(initial_k)?;
+        if pass.matched.len() >= k || initial_k >= total_live || pass.raw_count >= total_live {
+            pass.matched.truncate(k);
+            return Ok(pass.matched);
+        }
+
+        return fallback_scan();
+    }
+
+    if !has_filter {
+        let mut initial = run_index(k)?;
+        if initial.matched.len() >= k || initial.matched.len() >= total_live {
+            initial.matched.truncate(k);
+            return Ok(initial.matched);
+        }
+    }
+
+    let max_fetch_k = total_live.saturating_mul(16).max(4096);
+    let mut fetch_k = k.saturating_mul(4).max(64).min(max_fetch_k);
+    let mut prev_raw_count: Option<usize> = None;
+
+    loop {
+        let mut pass = run_index(fetch_k)?;
+        if pass.matched.len() >= k
+            || (!has_filter && pass.matched.len() >= total_live)
+            || pass.raw_count >= total_live
+        {
+            pass.matched.truncate(k);
+            return Ok(pass.matched);
+        }
+
+        let plateaued =
+            prev_raw_count.is_some_and(|prev| pass.raw_count < fetch_k && pass.raw_count <= prev);
+        if plateaued || fetch_k >= max_fetch_k {
+            break;
+        }
+
+        prev_raw_count = Some(pass.raw_count);
+        fetch_k = fetch_k.saturating_mul(2).min(max_fetch_k);
+    }
+
+    fallback_scan()
+}
+
+fn dedupe_batch_entries(
+    entries_in: Vec<VectorEntry>,
+    expected_dim: usize,
+) -> Result<Vec<VectorEntry>, String> {
+    for entry in &entries_in {
+        if entry.vector.len() != expected_dim {
+            return Err(format!(
+                "Dimension mismatch: expected {}, actual {}",
+                expected_dim,
+                entry.vector.len()
+            ));
+        }
+    }
+
+    let mut last_idx_by_id = HashMap::with_capacity(entries_in.len());
+    let mut normalized = Vec::with_capacity(entries_in.len());
+
+    for (idx, mut entry) in entries_in.into_iter().enumerate() {
+        let id = entry
+            .id
+            .take()
+            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+        entry.id = Some(id.clone());
+        last_idx_by_id.insert(id.clone(), idx);
+        normalized.push((id, entry));
+    }
+
+    let mut deduped = Vec::with_capacity(last_idx_by_id.len());
+    for (idx, (id, entry)) in normalized.into_iter().enumerate() {
+        if last_idx_by_id.get(&id).copied() == Some(idx) {
+            deduped.push(entry);
+        }
+    }
+
+    Ok(deduped)
 }
 
 enum DbBackend {
@@ -317,9 +395,10 @@ impl DbBackend {
     }
 
     fn insert_batch(&self, entries: Vec<VectorEntry>) -> Result<Vec<String>, String> {
+        let deduped = dedupe_batch_entries(entries, self.options().dimensions)?;
         match self {
-            DbBackend::Persistent(db) => db.insert_batch(entries).map_err(|e| e.to_string()),
-            DbBackend::InMemory(db) => db.insert_batch(entries),
+            DbBackend::Persistent(db) => db.insert_batch(deduped).map_err(|e| e.to_string()),
+            DbBackend::InMemory(db) => db.insert_batch(deduped),
         }
     }
 
@@ -375,55 +454,81 @@ impl DbBackend {
                     return Ok(Vec::new());
                 }
 
-                let run_persistent = |k: usize| -> Result<Vec<SearchResult>, String> {
-                    db.search(SearchQuery {
-                        vector: query.vector.clone(),
-                        k,
-                        filter: None,
-                        ef_search: query.ef_search,
-                    })
-                    .map_err(|e| e.to_string())
-                };
+                let total_live = db.len().map_err(|e| e.to_string())?;
+                let has_hnsw = db.options().hnsw_config.is_some();
 
-                let Some(filter) = &query.filter else {
-                    let results = run_persistent(query.k)?;
-                    if results.len() < query.k && db.options().hnsw_config.is_some() {
-                        let total = db.len().map_err(|e| e.to_string())?;
-                        if total > results.len() {
-                            let mut fetch_k = query.k.saturating_mul(4).max(64).min(total);
-                            loop {
-                                let mut widened = run_persistent(fetch_k)?;
-                                if widened.len() >= query.k || fetch_k >= total {
-                                    widened.truncate(query.k);
-                                    return Ok(widened);
-                                }
-                                fetch_k = next_fetch_k(fetch_k, total);
+                search_with_fallback(
+                    query.k,
+                    total_live,
+                    has_hnsw,
+                    query.filter.is_some(),
+                    |fetch_k| {
+                        let candidates = db
+                            .search(SearchQuery {
+                                vector: query.vector.clone(),
+                                k: fetch_k,
+                                filter: None,
+                                ef_search: query.ef_search,
+                            })
+                            .map_err(|e| e.to_string())?;
+
+                        let mut seen_ids = HashSet::with_capacity(candidates.len());
+                        let mut live_count = 0usize;
+                        let mut matched = Vec::new();
+
+                        for mut r in candidates {
+                            // VectorDB::search sets r.vector = Some(...) only for entries present in storage.
+                            if r.vector.is_none() {
+                                continue;
                             }
+                            if !seen_ids.insert(r.id.clone()) {
+                                continue;
+                            }
+                            live_count += 1;
+                            if let Some(filter) = &query.filter {
+                                if !matches_filter(r.metadata.as_ref(), filter) {
+                                    continue;
+                                }
+                            }
+                            if !hydrate {
+                                r.vector = None;
+                                r.metadata = None;
+                            }
+                            matched.push(r);
                         }
-                    }
-                    return Ok(results);
-                };
 
-                let total = db.len().map_err(|e| e.to_string())?;
-                if total == 0 {
-                    return Ok(Vec::new());
-                }
+                        Ok(IndexPass {
+                            raw_count: live_count,
+                            matched,
+                        })
+                    },
+                    || {
+                        let ids = db.keys().map_err(|e| e.to_string())?;
+                        let metric = db.options().distance_metric;
+                        let mut results = Vec::new();
 
-                let mut fetch_k = query.k.saturating_mul(4).max(64).min(total);
-                loop {
-                    let candidates = run_persistent(fetch_k)?;
-                    let mut matched: Vec<SearchResult> = candidates
-                        .into_iter()
-                        .filter(|r| matches_filter(r.metadata.as_ref(), filter))
-                        .collect();
+                        for id in ids {
+                            let Some(entry) = db.get(&id).map_err(|e| e.to_string())? else {
+                                continue;
+                            };
+                            if let Some(filter) = &query.filter {
+                                if !matches_filter(entry.metadata.as_ref(), filter) {
+                                    continue;
+                                }
+                            }
+                            let score = distance(&query.vector, &entry.vector, metric)
+                                .map_err(|e| e.to_string())?;
+                            results.push(SearchResult {
+                                id,
+                                score,
+                                vector: hydrate.then_some(entry.vector),
+                                metadata: if hydrate { entry.metadata } else { None },
+                            });
+                        }
 
-                    if matched.len() >= query.k || fetch_k >= total {
-                        matched.truncate(query.k);
-                        return Ok(matched);
-                    }
-
-                    fetch_k = next_fetch_k(fetch_k, total);
-                }
+                        Ok(finalize_fallback_scan(results, query.k))
+                    },
+                )
             }
         }
     }
@@ -500,6 +605,40 @@ pub struct DbResource {
     db: RwLock<Option<DbBackend>>,
 }
 
+static DROP_REAPER: OnceLock<Option<mpsc::Sender<DbBackend>>> = OnceLock::new();
+
+fn drop_reaper_sender() -> Option<&'static mpsc::Sender<DbBackend>> {
+    DROP_REAPER
+        .get_or_init(|| {
+            let (tx, rx) = mpsc::channel::<DbBackend>();
+            std::thread::Builder::new()
+                .name("ruvector-db-reaper".to_string())
+                .spawn(move || {
+                    while let Ok(backend) = rx.recv() {
+                        drop(backend);
+                    }
+                })
+                .ok()
+                .map(|_| tx)
+        })
+        .as_ref()
+}
+
+impl Drop for DbResource {
+    fn drop(&mut self) {
+        if let Some(backend) = self.db.get_mut().take() {
+            // Offload redb close and index deallocation from BEAM GC normal schedulers.
+            if let Some(tx) = drop_reaper_sender() {
+                if let Err(mpsc::SendError(backend)) = tx.send(backend) {
+                    drop(backend);
+                }
+            } else {
+                drop(backend);
+            }
+        }
+    }
+}
+
 #[rustler::resource_impl]
 impl rustler::Resource for DbResource {}
 
@@ -553,10 +692,7 @@ fn with_db<F, R>(resource: &ResourceArc<DbResource>, f: F) -> Result<R, DbAccess
 where
     F: FnOnce(&DbBackend) -> Result<R, String>,
 {
-    let guard = resource
-        .db
-        .read()
-        .map_err(|_| DbAccessError::Message("Database lock poisoned".to_string()))?;
+    let guard = resource.db.read();
     match guard.as_ref() {
         Some(backend) => f(backend).map_err(DbAccessError::Message),
         None => Err(DbAccessError::Closed),
@@ -1133,11 +1269,8 @@ fn open_db_with_options<'a>(
 
 #[rustler::nif(schedule = "DirtyIo")]
 fn close_db<'a>(env: Env<'a>, db_ref: ResourceArc<DbResource>) -> NifResult<Term<'a>> {
-    let mut guard = match db_ref.db.write() {
-        Ok(g) => g,
-        Err(_) => return Ok((error(), "Database lock poisoned").encode(env)),
-    };
-    *guard = None;
+    let backend = db_ref.db.write().take();
+    drop(backend);
     Ok(ok().encode(env))
 }
 
@@ -1256,6 +1389,12 @@ fn all_ids<'a>(env: Env<'a>, db_ref: ResourceArc<DbResource>) -> NifResult<Term<
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum FilterKeyKind {
+    String,
+    Atom,
+}
+
 fn extract_filter<'a>(
     filter: Option<Term<'a>>,
 ) -> Result<Option<HashMap<String, serde_json::Value>>, rustler::Error> {
@@ -1282,27 +1421,61 @@ fn extract_filter<'a>(
             return Ok(None);
         }
         let mut map = HashMap::with_capacity(list.len());
+        let mut key_kinds: HashMap<String, FilterKeyKind> = HashMap::with_capacity(list.len());
         for (k_term, v_term) in list {
-            let key = if let Ok(s) = k_term.decode::<String>() {
-                s
+            let (key, kind) = if let Ok(s) = k_term.decode::<String>() {
+                (s, FilterKeyKind::String)
             } else if is_nil_or_bool(k_term) {
                 return Err(rustler::Error::BadArg);
             } else if let Ok(name) = k_term.atom_to_string() {
                 if name == "__struct__" {
                     return Err(rustler::Error::BadArg);
                 }
-                name
+                (name, FilterKeyKind::Atom)
             } else {
                 return Err(rustler::Error::BadArg);
             };
+            if let Some(&prev_kind) = key_kinds.get(&key) {
+                if prev_kind != kind {
+                    return Err(rustler::Error::BadArg);
+                }
+            } else {
+                key_kinds.insert(key.clone(), kind);
+            }
             let val = term_to_json(v_term)?;
-            // Match Elixir Keyword first-key-wins semantics on duplicate keys.
+            // Match Elixir Keyword first-key-wins semantics on duplicate same-kind keys.
             map.entry(key).or_insert(val);
         }
         return Ok(Some(map));
     }
 
     Err(rustler::Error::BadArg)
+}
+
+fn decode_search_query<'a>(
+    query_vector_term: Term<'a>,
+    filter: Option<Term<'a>>,
+    limit_term: Term<'a>,
+    ef_search_term: Option<Term<'a>>,
+) -> Result<SearchQuery, String> {
+    let query_vector =
+        decode_finite_f32_vec(query_vector_term).map_err(|_| "Invalid query vector".to_string())?;
+    let limit = limit_term
+        .decode::<usize>()
+        .map_err(|_| "Invalid search limit k".to_string())?;
+    let ef_search_arg = match ef_search_term {
+        None => None,
+        Some(t) if rustler::types::atom::nil() == t => None,
+        Some(t) => Some(decode_pos_usize(t, "ef_search")?),
+    };
+    let query_filter = extract_filter(filter).map_err(|_| "Invalid filter format".to_string())?;
+
+    Ok(SearchQuery {
+        vector: query_vector,
+        k: limit,
+        filter: query_filter,
+        ef_search: ef_search_arg,
+    })
 }
 
 #[rustler::nif(schedule = "DirtyCpu")]
@@ -1312,26 +1485,11 @@ fn search<'a>(
     query_vector_term: Term<'a>,
     filter: Option<Term<'a>>,
     limit_term: Term<'a>,
+    ef_search_term: Option<Term<'a>>,
 ) -> NifResult<Term<'a>> {
-    let query_vector = match decode_finite_f32_vec(query_vector_term) {
-        Ok(v) => v,
-        Err(_) => return Ok((error(), "Invalid query vector").encode(env)),
-    };
-
-    let Ok(limit) = limit_term.decode::<usize>() else {
-        return Ok((error(), "Invalid search limit k").encode(env));
-    };
-
-    let query_filter = match extract_filter(filter) {
-        Ok(f) => f,
-        Err(_) => return Ok((error(), "Invalid filter format").encode(env)),
-    };
-
-    let query = SearchQuery {
-        vector: query_vector,
-        k: limit,
-        filter: query_filter,
-        ef_search: None,
+    let query = match decode_search_query(query_vector_term, filter, limit_term, ef_search_term) {
+        Ok(q) => q,
+        Err(msg) => return Ok((error(), msg).encode(env)),
     };
 
     match with_db(&db_ref, |db| db.search(query, false)) {
@@ -1355,34 +1513,9 @@ fn search_detailed<'a>(
     limit_term: Term<'a>,
     ef_search_term: Option<Term<'a>>,
 ) -> NifResult<Term<'a>> {
-    let query_vector = match decode_finite_f32_vec(query_vector_term) {
-        Ok(v) => v,
-        Err(_) => return Ok((error(), "Invalid query vector").encode(env)),
-    };
-
-    let Ok(limit) = limit_term.decode::<usize>() else {
-        return Ok((error(), "Invalid search limit k").encode(env));
-    };
-
-    let ef_search_arg = match ef_search_term {
-        None => None,
-        Some(t) if rustler::types::atom::nil() == t => None,
-        Some(t) => match decode_pos_usize(t, "ef_search") {
-            Ok(v) => Some(v),
-            Err(msg) => return Ok((error(), msg).encode(env)),
-        },
-    };
-
-    let query_filter = match extract_filter(filter) {
-        Ok(f) => f,
-        Err(_) => return Ok((error(), "Invalid filter format").encode(env)),
-    };
-
-    let query = SearchQuery {
-        vector: query_vector,
-        k: limit,
-        filter: query_filter,
-        ef_search: ef_search_arg,
+    let query = match decode_search_query(query_vector_term, filter, limit_term, ef_search_term) {
+        Ok(q) => q,
+        Err(msg) => return Ok((error(), msg).encode(env)),
     };
 
     match with_db(&db_ref, |db| db.search(query, true)) {
