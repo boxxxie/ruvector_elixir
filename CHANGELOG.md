@@ -5,6 +5,14 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.1] - 2026-11-21
+
+### Changed
+
+- Upgraded `ruvector-core` from `2.3.0` to `2.5.2` (bringing `FlatGraph`-based HNSW, `Weak`-backed storage pool lifecycle, and upstream recall fixes) and refreshed compatible Cargo dependencies (`redb 2.6.4`, `hnsw_rs 0.3.5`, `serde_json 1.0.154`, `uuid 1.29.3`).
+- Upgraded the Rust `rustler` NIF crate from `0.38.0` to `0.39.0` (retaining Rust `1.91` MSRV and Mix `rustler ~> 0.38.0`).
+- Added `QuantizationConfig::Turbo4` encoding in `info/1` and updated the `db_info` `:quantization` typespec and docs.
+
 ## [0.2.0] - 2026-11-21
 
 ### Breaking Changes
@@ -46,5 +54,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Initial Elixir NIF bindings for `ruvector-core` with flat and HNSW indexing, persistence (`.rvf`), metadata filtering, direct distance calculations, and `RuvectorElixir.VectorEntry`.
 
+[0.2.1]: https://github.com/boxxxie/ruvector_elixir/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/boxxxie/ruvector_elixir/releases/tag/v0.2.0
 [0.1.0]: https://github.com/boxxxie/ruvector_elixir/releases/tag/v0.1.0
