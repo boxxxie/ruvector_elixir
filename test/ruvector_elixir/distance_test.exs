@@ -76,6 +76,14 @@ defmodule RuvectorElixir.DistanceTest do
         RuvectorElixir.distance([1.0, 0.0], [0.0, 1.0], :l2)
       end
 
+      assert_raise ArgumentError, ~r/non-empty/, fn ->
+        RuvectorElixir.distance([], [], :cosine)
+      end
+
+      assert_raise ArgumentError, ~r/non-empty/, fn ->
+        RuvectorElixir.distance([], [], :euclidean)
+      end
+
       assert {:error, "Invalid vector a"} =
                RuvectorElixir.distance([1.0e100, 0.0], [0.0, 1.0], :euclidean)
     end

@@ -40,7 +40,7 @@ defmodule RuvectorElixir.VectorEntry do
   @spec new([number()], keyword() | map()) :: t()
   def new(vector, opts \\ [])
 
-  def new(vector, opts) when is_list(vector) and is_list(opts) do
+  def new(vector, opts) when is_list(vector) and vector != [] and is_list(opts) do
     if not Keyword.keyword?(opts) do
       raise ArgumentError, "VectorEntry options must be a keyword list or map"
     end
@@ -54,7 +54,8 @@ defmodule RuvectorElixir.VectorEntry do
     }
   end
 
-  def new(vector, %{} = opts) when is_list(vector) and not is_struct(opts) do
+  def new(vector, %{} = opts)
+      when is_list(vector) and vector != [] and not is_struct(opts) do
     %{id: raw_id, metadata: raw_metadata} = extract_opts!(opts)
 
     %__MODULE__{
@@ -66,7 +67,7 @@ defmodule RuvectorElixir.VectorEntry do
 
   def new(_vector, _opts) do
     raise ArgumentError,
-          "VectorEntry.new/2 expects a list of numbers and a keyword list or plain map of options"
+          "VectorEntry.new/2 expects a non-empty list of numbers and a keyword list or plain map of options"
   end
 
   @doc """
@@ -91,8 +92,8 @@ defmodule RuvectorElixir.VectorEntry do
         :error -> Map.get(map, "vector")
       end
 
-    if not is_list(vector) do
-      raise ArgumentError, "VectorEntry.from_map/1 expects a map with a :vector list"
+    if not is_list(vector) or vector == [] do
+      raise ArgumentError, "VectorEntry.from_map/1 expects a map with a non-empty :vector list"
     end
 
     %{id: raw_id, metadata: raw_metadata} = extract_entry_fields!(map)
@@ -152,9 +153,23 @@ defmodule RuvectorElixir.VectorEntry do
     %{id: id, metadata: metadata}
   end
 
+  @min_i128 -170_141_183_460_469_231_731_687_303_715_884_105_728
+  @max_u128 340_282_366_920_938_463_463_374_607_431_768_211_455
+
   defp normalize_id!(nil), do: nil
   defp normalize_id!(bool) when is_boolean(bool), do: raise(ArgumentError, "ID cannot be boolean")
+
+  defp normalize_id!(:"") do
+    raise ArgumentError, "VectorEntry :id cannot be an empty atom"
+  end
+
   defp normalize_id!(atom) when is_atom(atom), do: Atom.to_string(atom)
+
+  defp normalize_id!(int) when is_integer(int) and (int < @min_i128 or int > @max_u128) do
+    raise ArgumentError,
+          "VectorEntry :id integer out of 128-bit range: #{inspect(int)}"
+  end
+
   defp normalize_id!(int) when is_integer(int), do: Integer.to_string(int)
   defp normalize_id!(""), do: raise(ArgumentError, "VectorEntry :id cannot be an empty string")
 
@@ -183,26 +198,36 @@ defmodule RuvectorElixir.VectorEntry do
     end
   end
 
+  # 2^128: integers at or above this magnitude overflow IEEE-754 f32 before f64 conversion.
+  @f32_integer_overflow_bound 0x1_0000_0000_0000_0000_0000_0000_0000_0000
+
   defp to_finite_f32_float!(val) when is_float(val) do
-    if finite_f32?(val) do
-      val
-    else
-      raise ArgumentError, "Vector element overflows 32-bit float range: #{inspect(val)}"
-    end
+    ensure_finite_f32!(val, val)
+  end
+
+  defp to_finite_f32_float!(val)
+       when is_integer(val) and abs(val) >= @f32_integer_overflow_bound do
+    raise_f32_overflow!(val)
   end
 
   defp to_finite_f32_float!(val) when is_integer(val) do
-    f = val * 1.0
-
-    if finite_f32?(f) do
-      f
-    else
-      raise ArgumentError, "Vector element overflows 32-bit float range: #{inspect(val)}"
-    end
+    ensure_finite_f32!(val * 1.0, val)
   end
 
   defp to_finite_f32_float!(other) do
     raise ArgumentError, "Vector elements must be numbers, got: #{inspect(other)}"
+  end
+
+  defp ensure_finite_f32!(float_val, original_val) do
+    if finite_f32?(float_val) do
+      float_val
+    else
+      raise_f32_overflow!(original_val)
+    end
+  end
+
+  defp raise_f32_overflow!(val) do
+    raise ArgumentError, "Vector element overflows 32-bit float range: #{inspect(val)}"
   end
 
   defp finite_f32?(val) do

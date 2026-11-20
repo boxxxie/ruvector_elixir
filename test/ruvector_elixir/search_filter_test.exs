@@ -144,6 +144,18 @@ defmodule RuvectorElixir.SearchFilterTest do
       for r <- dup_results do
         assert r.metadata["category"] == 1
       end
+
+      assert {:ok, mixed_results} =
+               RuvectorElixir.search_detailed(db, query, 10,
+                 filter: [{"category", 1}, {:decade, 2}]
+               )
+
+      assert length(mixed_results) > 0
+
+      for r <- mixed_results do
+        assert r.metadata["category"] == 1
+        assert r.metadata["decade"] == 2
+      end
     end
 
     test "numeric equality between integer and float metadata values", %{db: db} do
@@ -188,6 +200,18 @@ defmodule RuvectorElixir.SearchFilterTest do
 
       detailed = RuvectorElixir.search_detailed!(db, query, 5, filter: [category: 1])
       assert length(detailed) > 0
+
+      assert {:ok, tuned_ids} =
+               RuvectorElixir.search(db, query, 5, filter: [category: 1], ef_search: 64)
+
+      assert length(tuned_ids) > 0
+
+      assert tuned_ids ==
+               RuvectorElixir.search!(db, query, 5, filter: [category: 1], ef_search: 64)
+
+      assert_raise ArgumentError, fn ->
+        RuvectorElixir.search(db, query, 5, ef_search: 0)
+      end
 
       assert_raise Error, fn ->
         RuvectorElixir.search!(db, [1.0, 2.0], 5)

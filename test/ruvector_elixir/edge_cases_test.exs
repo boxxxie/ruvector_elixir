@@ -289,6 +289,24 @@ defmodule RuvectorElixir.EdgeCasesTest do
         RuvectorElixir.search(db, [1.0, 0.0, 0.0, 0.0], 5, filter: ~D[2026-01-01])
       end
 
+      for invalid_filter <- [
+            [true: "x"],
+            [false: "x"],
+            [nil: "x"],
+            [__struct__: Date],
+            [{<<0xFF, 0xFE>>, "x"}],
+            [{:a, 1} | :bad],
+            %{__struct__: "fake"}
+          ] do
+        assert_raise ArgumentError, fn ->
+          RuvectorElixir.search(db, [1.0, 0.0, 0.0, 0.0], 5, filter: invalid_filter)
+        end
+
+        assert_raise ArgumentError, fn ->
+          RuvectorElixir.search_detailed(db, [1.0, 0.0, 0.0, 0.0], 5, filter: invalid_filter)
+        end
+      end
+
       assert {:error, "Invalid filter format"} =
                RuvectorElixir.search(db, [1.0, 0.0, 0.0, 0.0], 5,
                  filter: [{"tenant", "a"}, {:tenant, "b"}]
@@ -358,6 +376,40 @@ defmodule RuvectorElixir.EdgeCasesTest do
       assert_raise ArgumentError, fn ->
         RuvectorElixir.open(db_path, 4, quantization: %{type: :none, subspaces: 8})
       end
+
+      assert_raise ArgumentError, fn ->
+        RuvectorElixir.open(db_path, 4, quantization: %{type: "Scalar", subspaces: 4})
+      end
+
+      assert_raise ArgumentError, fn ->
+        RuvectorElixir.open(db_path, 16, quantization: %{type: "SCALAR", subspaces: 8})
+      end
+
+      assert_raise ArgumentError, fn ->
+        RuvectorElixir.open(db_path, 4, quantization: [type: "BINARY", k: 256])
+      end
+
+      assert_raise ArgumentError, fn ->
+        RuvectorElixir.open(db_path, 4, quantization: %{type: "None", k: 128})
+      end
+
+      assert {:ok, scalar_db} =
+               RuvectorElixir.open("memory://quant_scalar_mixed", 4,
+                 quantization: %{type: "Scalar"}
+               )
+
+      assert {:ok, %{quantization: :scalar}} = RuvectorElixir.info(scalar_db)
+      assert :ok = RuvectorElixir.close(scalar_db)
+
+      assert {:ok, product_db} =
+               RuvectorElixir.open("memory://quant_product_mixed", 4,
+                 quantization: %{type: "Product", subspaces: 2}
+               )
+
+      assert {:ok, %{quantization: %{type: :product, subspaces: 2, k: 256}}} =
+               RuvectorElixir.info(product_db)
+
+      assert :ok = RuvectorElixir.close(product_db)
 
       assert_raise ArgumentError, fn ->
         RuvectorElixir.open(db_path, 4, metric: :invalid, metric: :cosine)
@@ -460,12 +512,53 @@ defmodule RuvectorElixir.EdgeCasesTest do
       end
 
       assert_raise ArgumentError, fn ->
+        VectorEntry.new([1.0, 2.0], id: :"")
+      end
+
+      assert_raise ArgumentError, fn ->
+        VectorEntry.new([1.0, 2.0], id: Bitwise.bsl(1, 128))
+      end
+
+      assert_raise ArgumentError, fn ->
+        VectorEntry.new([1.0, 2.0], id: -Bitwise.bsl(1, 127) - 1)
+      end
+
+      assert_raise ArgumentError, fn ->
+        VectorEntry.new([])
+      end
+
+      assert_raise ArgumentError, fn ->
+        VectorEntry.from_map(%{vector: []})
+      end
+
+      assert_raise ArgumentError, fn ->
         VectorEntry.new([1.0, 2.0], id: <<0xFF, 0xFE>>)
       end
 
       assert_raise ArgumentError, fn ->
         VectorEntry.new([1.0e100, 2.0])
       end
+
+      assert_raise ArgumentError, fn ->
+        VectorEntry.new([Integer.pow(10, 400)])
+      end
+
+      assert_raise ArgumentError, fn ->
+        VectorEntry.new([-Integer.pow(10, 400)])
+      end
+
+      assert_raise ArgumentError, fn ->
+        VectorEntry.from_map(%{vector: [Integer.pow(10, 400)]})
+      end
+
+      assert_raise ArgumentError, fn ->
+        VectorEntry.new([340_282_356_779_733_661_637_539_395_458_142_568_448])
+      end
+
+      max_f32_int = 340_282_346_638_528_859_811_704_183_484_516_925_440
+      max_entry = VectorEntry.new([max_f32_int])
+      assert [val] = max_entry.vector
+      assert is_float(val)
 
       assert_raise ArgumentError, fn ->
         VectorEntry.new([1.0, 2.0], metadata: ~D[2026-01-01])
@@ -553,6 +646,7 @@ defmodule RuvectorElixir.EdgeCasesTest do
       for {path, opts} <- targets do
         assert {:ok, db} = RuvectorElixir.open(path, 4, opts)
 
+        # Invalid earlier overwritten entry still rejects the batch atomically
         assert {:error, reason} =
                  RuvectorElixir.insert_batch(db, [
                    %{id: "dup", vector: [1.0, 2.0]},
@@ -591,7 +685,44 @@ defmodule RuvectorElixir.EdgeCasesTest do
       end
     end
 
-    test "GC reaper releases unclosed persistent DB handles safely", %{tmp_dir: tmp_dir} do
+    test "with_open/3,4 and GC reaper release persistent DB handles safely", %{tmp_dir: tmp_dir} do
+      db_path = Path.join(tmp_dir, "with_open.rvf")
+
+      assert {:ok, {:inserted, "w1"}} =
+               RuvectorElixir.with_open(db_path, 4, [metric: :euclidean], fn db ->
+                 {:ok, id} = RuvectorElixir.insert(db, %{id: "w1", vector: [1.0, 2.0, 3.0, 4.0]})
+                 {:inserted, id}
+               end)
+
+      # Reopening immediately succeeds because with_open closed the handle
+      assert {:ok, 1} =
+               RuvectorElixir.with_open(db_path, 4, fn db ->
+                 {:ok, total} = RuvectorElixir.len(db)
+                 total
+               end)
+
+      # Exception inside callback still closes the handle cleanly
+      assert_raise RuntimeError, "boom", fn ->
+        RuvectorElixir.with_open!(db_path, 4, fn _db ->
+          raise "boom"
+        end)
+      end
+
+      assert "w1" ==
+               RuvectorElixir.with_open!(db_path, 4, fn db ->
+                 assert {:ok, entry} = RuvectorElixir.get(db, "w1")
+                 entry.id
+               end)
+
+      assert_raise ArgumentError, fn ->
+        RuvectorElixir.with_open(db_path, 4, :not_a_fun)
+      end
+
+      assert_raise ArgumentError, fn ->
+        RuvectorElixir.with_open!(db_path, 4, [], :not_a_fun)
+      end
+
+      # Unclosed persistent handle collected by GC is offloaded to background reaper
       gc_path = Path.join(tmp_dir, "gc_reaper.rvf")
 
       task =
@@ -610,11 +741,9 @@ defmodule RuvectorElixir.EdgeCasesTest do
   end
 
   defp reopen_eventually(path, dims, attempts_left) do
-    case RuvectorElixir.open(path, dims) do
-      {:ok, db} ->
-        res = RuvectorElixir.get(db, "gc1")
-        :ok = RuvectorElixir.close(db)
-        res
+    case RuvectorElixir.with_open(path, dims, fn db -> RuvectorElixir.get(db, "gc1") end) do
+      {:ok, {:ok, entry}} ->
+        {:ok, entry}
 
       {:error, _reason} when attempts_left > 1 ->
         Process.sleep(20)

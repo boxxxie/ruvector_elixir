@@ -178,6 +178,15 @@ defmodule RuvectorElixir.StorageTest do
       assert {:ok, fetched} = RuvectorElixir.get(db, big_id)
       assert fetched.id == "18446744073709551616"
       assert {:ok, true} = RuvectorElixir.delete(db, big_id)
+
+      for boundary_id <- [-Bitwise.bsl(1, 127), Bitwise.bsl(1, 128) - 1] do
+        boundary_entry = VectorEntry.new([1.0, 2.0, 3.0], id: boundary_id)
+        expected_str = Integer.to_string(boundary_id)
+        assert {:ok, ^expected_str} = RuvectorElixir.insert(db, boundary_entry)
+        assert {:ok, found} = RuvectorElixir.get(db, boundary_id)
+        assert found.id == expected_str
+        assert {:ok, true} = RuvectorElixir.delete(db, boundary_id)
+      end
     end
 
     test "get_struct and get_struct! return VectorEntry struct", %{db: db} do

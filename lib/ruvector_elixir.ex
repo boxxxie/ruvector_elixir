@@ -64,8 +64,8 @@ defmodule RuvectorElixir do
             }
           | vector()
   @type search_filter :: map() | keyword() | nil
-  @type search_option :: {:filter, search_filter()}
-  @type search_detailed_option :: {:filter, search_filter()} | {:ef_search, pos_integer() | nil}
+  @type search_option :: {:filter, search_filter()} | {:ef_search, pos_integer() | nil}
+  @type search_detailed_option :: search_option()
   @type search_result :: %{
           id: String.t(),
           score: float(),
@@ -173,6 +173,77 @@ defmodule RuvectorElixir do
       :ok -> :ok
       {:error, reason} -> raise Error, reason
     end
+  end
+
+  @doc """
+  Opens a database, passes the handle to `fun`, and ensures `close/1` runs after `fun` completes or raises.
+
+  Returns `{:ok, result}` on success, or `{:error, reason}` if `open/3` fails.
+  """
+  @spec with_open(Path.t(), pos_integer(), (db_ref() -> result)) ::
+          {:ok, result} | {:error, String.t()}
+        when result: var
+  @spec with_open(Path.t(), pos_integer(), db_options() | keyword(), (db_ref() -> result)) ::
+          {:ok, result} | {:error, String.t()}
+        when result: var
+  def with_open(path, dimensions, fun) when is_function(fun, 1) do
+    with_open(path, dimensions, %{}, fun)
+  end
+
+  def with_open(_path, _dimensions, fun) do
+    raise ArgumentError,
+          "RuvectorElixir.with_open/3 expects a 1-arity function, got: #{inspect(fun)}"
+  end
+
+  def with_open(path, dimensions, opts, fun) when is_function(fun, 1) do
+    case open(path, dimensions, opts) do
+      {:ok, db} ->
+        try do
+          {:ok, fun.(db)}
+        after
+          close(db)
+        end
+
+      {:error, _} = error ->
+        error
+    end
+  end
+
+  def with_open(_path, _dimensions, _opts, fun) do
+    raise ArgumentError,
+          "RuvectorElixir.with_open/4 expects a 1-arity function, got: #{inspect(fun)}"
+  end
+
+  @doc """
+  Opens a database with `open!/3`, passes the handle to `fun`, ensures `close/1` runs,
+  and returns the result of `fun` directly.
+  """
+  @spec with_open!(Path.t(), pos_integer(), (db_ref() -> result)) :: result when result: var
+  @spec with_open!(Path.t(), pos_integer(), db_options() | keyword(), (db_ref() -> result)) ::
+          result
+        when result: var
+  def with_open!(path, dimensions, fun) when is_function(fun, 1) do
+    with_open!(path, dimensions, %{}, fun)
+  end
+
+  def with_open!(_path, _dimensions, fun) do
+    raise ArgumentError,
+          "RuvectorElixir.with_open!/3 expects a 1-arity function, got: #{inspect(fun)}"
+  end
+
+  def with_open!(path, dimensions, opts, fun) when is_function(fun, 1) do
+    db = open!(path, dimensions, opts)
+
+    try do
+      fun.(db)
+    after
+      close(db)
+    end
+  end
+
+  def with_open!(_path, _dimensions, _opts, fun) do
+    raise ArgumentError,
+          "RuvectorElixir.with_open!/4 expects a 1-arity function, got: #{inspect(fun)}"
   end
 
   # ============================================================================
@@ -358,6 +429,7 @@ defmodule RuvectorElixir do
   ## Options
 
   - `:filter` - Optional metadata filter map or keyword list (default: `nil`).
+  - `:ef_search` - Optional positive integer HNSW `ef_search` override (default: `nil`).
 
   Returns `{:ok, [id]}` on success, or `{:error, reason}` on failure.
   """
@@ -367,8 +439,10 @@ defmodule RuvectorElixir do
 
   def search(db_ref, query_vector, k, opts)
       when is_reference(db_ref) and is_list(query_vector) and is_integer(k) and k >= 0 do
-    %{filter: filter} = validate_search_opts!(opts, [:filter])
-    Native.search(db_ref, query_vector, filter, k)
+    %{filter: filter, ef_search: ef_search} =
+      validate_search_opts!(opts, [:filter, :ef_search])
+
+    Native.search(db_ref, query_vector, filter, k, ef_search)
   end
 
   def search(db_ref, query_vector, k, _opts) do
@@ -459,7 +533,7 @@ defmodule RuvectorElixir do
 
   @dirty_distance_threshold 4096
 
-  def distance(a, b, metric) when is_list(a) and is_list(b) do
+  def distance(a, b, metric) when is_list(a) and a != [] and is_list(b) and b != [] do
     validated_metric = validate_metric!(metric)
 
     if length(a) > @dirty_distance_threshold or length(b) > @dirty_distance_threshold do
@@ -470,7 +544,7 @@ defmodule RuvectorElixir do
   end
 
   def distance(_a, _b, _metric) do
-    raise ArgumentError, "RuvectorElixir.distance/3 expects two lists of numbers"
+    raise ArgumentError, "RuvectorElixir.distance/3 expects two non-empty lists of numbers"
   end
 
   @doc """
@@ -702,17 +776,15 @@ defmodule RuvectorElixir do
       end)
 
     type_val = Map.get(normalized, "type")
+    normalized_type = normalize_quantization_type_name(type_val)
     has_product_params = Map.has_key?(normalized, "subspaces") or Map.has_key?(normalized, "k")
 
-    if type_val in [:scalar, :binary, :none, "scalar", "binary", "none"] and has_product_params do
+    if normalized_type in ["scalar", "binary", "none"] and has_product_params do
       raise ArgumentError,
             ":subspaces and :k are only valid with :product quantization, not #{inspect(type_val)}"
     end
 
-    is_product =
-      type_val in [:product, "product"] or
-        (is_binary(type_val) and String.downcase(type_val) == "product") or
-        (is_nil(type_val) and has_product_params)
+    is_product = normalized_type == "product" or (is_nil(normalized_type) and has_product_params)
 
     if is_product do
       subspaces = Map.get(normalized, "subspaces", 8)
@@ -725,6 +797,10 @@ defmodule RuvectorElixir do
 
     normalized
   end
+
+  defp normalize_quantization_type_name(nil), do: nil
+  defp normalize_quantization_type_name(t) when is_atom(t), do: Atom.to_string(t)
+  defp normalize_quantization_type_name(t) when is_binary(t), do: String.downcase(t)
 
   defp validate_quantization_type!(t) when t in [:scalar, :binary, :none, :product], do: t
 
@@ -789,17 +865,13 @@ defmodule RuvectorElixir do
   end
 
   defp validate_filter!(nil), do: :ok
-  defp validate_filter!(%{} = filter) when not is_struct(filter), do: :ok
+
+  defp validate_filter!(%{} = filter)
+       when not is_struct(filter) and not is_map_key(filter, :__struct__),
+       do: :ok
 
   defp validate_filter!(filter) when is_list(filter) do
-    if Keyword.keyword?(filter) or
-         Enum.all?(filter, fn
-           {k, _v} when is_binary(k) or (is_atom(k) and not is_boolean(k) and not is_nil(k)) ->
-             true
-
-           _ ->
-             false
-         end) do
+    if valid_filter_list?(filter) do
       :ok
     else
       raise ArgumentError,
@@ -811,4 +883,17 @@ defmodule RuvectorElixir do
     raise ArgumentError,
           ":filter must be a plain map, keyword list, or nil, got: #{inspect(other)}"
   end
+
+  defp valid_filter_list?([]), do: true
+
+  defp valid_filter_list?([{k, _v} | rest]) when is_binary(k) do
+    String.valid?(k) and valid_filter_list?(rest)
+  end
+
+  defp valid_filter_list?([{k, _v} | rest])
+       when is_atom(k) and not is_boolean(k) and not is_nil(k) and k != :__struct__ do
+    valid_filter_list?(rest)
+  end
+
+  defp valid_filter_list?(_other), do: false
 end

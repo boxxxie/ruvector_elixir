@@ -7,7 +7,7 @@ defmodule RuvectorElixirTest do
   test "can open a database and search", %{tmp_dir: tmp_dir} do
     db_path = Path.join(tmp_dir, "ruvector_test.rvf")
     assert {:ok, db_ref} = RuvectorElixir.open(db_path, 768)
-    assert is_reference(db_ref)
+    assert {:ok, 0} = RuvectorElixir.len(db_ref)
 
     query_vector = List.duplicate(0.1, 768)
     assert {:ok, []} = RuvectorElixir.search(db_ref, query_vector, 5)
