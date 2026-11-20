@@ -8,7 +8,7 @@ The NIF interfaces directly with the `ruvector-core` vector database engine writ
 
 ## Building
 
-The NIF is compiled automatically by [Rustler](https://github.com/rusterlium/rustler) during `mix compile`. A local Rust toolchain (`cargo` and `rustc` 1.75+) is required.
+The NIF is compiled automatically by [Rustler](https://github.com/rusterlium/rustler) during `mix compile`. A local Rust toolchain (`cargo` and `rustc` 1.91+) is required.
 
 ## Exports
 

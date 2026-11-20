@@ -1,8 +1,13 @@
 # RuvectorElixir
 
+[![CI](https://github.com/boxxxie/ruvector_elixir/actions/workflows/ci.yml/badge.svg)](https://github.com/boxxxie/ruvector_elixir/actions/workflows/ci.yml)
 [![Hex.pm](https://img.shields.io/hexpm/v/ruvector_elixir.svg)](https://hex.pm/packages/ruvector_elixir)
 [![HexDocs](https://img.shields.io/badge/hex-docs-purple.svg)](https://hexdocs.pm/ruvector_elixir)
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+[![Elixir](https://img.shields.io/badge/Elixir-~%3E%201.18-4B275F.svg?logo=elixir&logoColor=white)](https://elixir-lang.org)
+[![Rust](https://img.shields.io/badge/Rust-1.91%2B-DEA584.svg?logo=rust&logoColor=black)](https://www.rust-lang.org)
+[![Rustler](https://img.shields.io/badge/Rustler-0.38-CE422B.svg)](https://github.com/rusterlium/rustler)
+[![ruvector-core](https://img.shields.io/badge/ruvector--core-2.3.0-0EA5E9.svg)](https://github.com/ruvnet/ruvector)
+[![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 
 Official Elixir bindings for [**ruvector**](https://github.com/ruvnet/ruvector), an ultra-fast embedded vector database and GraphRAG metadata engine written in Rust.
 
@@ -40,7 +45,7 @@ end
 
 ### System Requirements
 
-A working **Rust toolchain** (Rust 1.75+ or later) is required to compile the native extension:
+A working **Rust toolchain** (Rust 1.91+ or later) is required to compile the native extension:
 
 ```bash
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
@@ -104,15 +109,15 @@ Perform top-`k` similarity search using a query vector:
 query = [0.1, 0.2, 0.3, ...]
 
 # Fast ID-only search
-ids = RuvectorElixir.search(db, query, 5)
-# => ["doc_1", "doc_3", "doc_2"]
+{:ok, ids} = RuvectorElixir.search(db, query, 5)
+# => {:ok, ["doc_1", "doc_3", "doc_2"]}
 
 # Search with metadata filtering
-filtered_ids = RuvectorElixir.search(db, query, %{"category" => "programming"}, 5)
-# => ["doc_1", "doc_3"]
+{:ok, filtered_ids} = RuvectorElixir.search(db, query, 5, filter: %{"category" => "programming"})
+# => {:ok, ["doc_1", "doc_3"]}
 
 # Detailed search (returns ID, distance score, vector, and metadata)
-{:ok, results} = RuvectorElixir.search_detailed(db, query, %{"category" => "programming"}, 5)
+{:ok, results} = RuvectorElixir.search_detailed(db, query, 5, filter: %{"category" => "programming"})
 Enum.each(results, fn r ->
   IO.puts("ID: #{r.id} (Score: #{r.score}) - Title: #{r.metadata["title"]}")
 end)
@@ -126,17 +131,20 @@ end)
 IO.inspect(entry.vector)
 IO.inspect(entry.metadata)
 
-# Check count and keys
+# Check count, keys, and emptiness
 {:ok, count} = RuvectorElixir.len(db)
 {:ok, all_ids} = RuvectorElixir.keys(db)
-{:ok, false} = RuvectorElixir.empty?(db)
+false = RuvectorElixir.empty?(db)
 
 # Delete an entry
 {:ok, true} = RuvectorElixir.delete(db, "doc_1")
 
 # Database info
-info = RuvectorElixir.info(db)
-# => %{"dimensions" => 128, "distance_metric" => "euclidean", "node_count" => 2}
+{:ok, info} = RuvectorElixir.info(db)
+# => %{dimensions: 128, distance_metric: :euclidean, node_count: 2, ...}
+
+# Explicitly release handle when finished
+:ok = RuvectorElixir.close(db)
 ```
 
 ### 5. Distance Calculations
@@ -147,10 +155,10 @@ Direct vector-to-vector distance calculations without opening a database:
 v1 = [1.0, 0.0, 0.0]
 v2 = [0.0, 1.0, 0.0]
 
-{:ok, dist} = RuvectorElixir.distance(v1, v2, :cosine)
+{:ok, dist} = RuvectorElixir.distance(v1, v2)
 # => {:ok, 1.0}
 
-{:ok, dist} = RuvectorElixir.calculate_distance(v1, v2, :euclidean)
+{:ok, dist} = RuvectorElixir.distance(v1, v2, :euclidean)
 # => {:ok, 1.4142135}
 ```
 
@@ -198,7 +206,7 @@ v2 = [0.0, 1.0, 0.0]
                +---------------+---------------+
                                |
                     ruvector-core (Rust)
-                    - VectorDB & Sled Storage
+                    - VectorDB & redb Storage
                     - HNSW & Flat Indexing
                     - SIMD Distance Metrics
 ```
