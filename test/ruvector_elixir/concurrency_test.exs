@@ -6,6 +6,7 @@ defmodule RuvectorElixir.ConcurrencyTest do
   setup %{tmp_dir: tmp_dir} do
     db_path = Path.join(tmp_dir, "ruvector_concurrent.rvf")
     {:ok, db} = RuvectorElixir.open(db_path, 32)
+    on_exit(fn -> RuvectorElixir.close(db) end)
     {:ok, db: db, db_path: db_path, tmp_dir: tmp_dir}
   end
 
@@ -88,18 +89,20 @@ defmodule RuvectorElixir.ConcurrencyTest do
 
     test "concurrent ANN searches across multiple BEAM tasks", %{db: db} do
       for i <- 0..99 do
-        vec = for(j <- 0..31, do: (i + j) * 0.05)
+        vec = for j <- 0..31, do: :math.sin((i + 1) * (j + 1) * 0.13) + 1.0
         assert {:ok, _} = RuvectorElixir.insert(db, %{id: "ann_#{i}", vector: vec})
       end
 
       tasks =
         for task_id <- 0..9 do
           Task.async(fn ->
+            query = for j <- 0..31, do: :math.sin((task_id * 10 + 1) * (j + 1) * 0.13) + 1.0
+
             for _i <- 0..19 do
-              query = List.duplicate(task_id * 0.1, 32)
               assert {:ok, results} = RuvectorElixir.search(db, query, 5)
               assert is_list(results)
               assert length(results) == 5
+              assert hd(results) == "ann_#{task_id * 10}"
             end
           end)
         end
@@ -110,6 +113,7 @@ defmodule RuvectorElixir.ConcurrencyTest do
     test "concurrent operations on separate database handle", %{tmp_dir: tmp_dir} do
       db_path = Path.join(tmp_dir, "ruvector_concurrent_sep.rvf")
       {:ok, sep_db} = RuvectorElixir.open(db_path, 16)
+      on_exit(fn -> RuvectorElixir.close(sep_db) end)
 
       tasks =
         for task_id <- 0..7 do
@@ -136,6 +140,8 @@ defmodule RuvectorElixir.ConcurrencyTest do
                  metric: :cosine,
                  hnsw: [m: 16, ef_construction: 64, ef_search: 64, max_elements: 2_000]
                )
+
+      on_exit(fn -> RuvectorElixir.close(hnsw_db) end)
 
       for i <- 0..49 do
         vec = for j <- 0..31, do: (i + j + 1) * 0.05

@@ -39,17 +39,22 @@ defmodule RuvectorElixir do
           | :binary
           | :none
           | String.t()
+          | keyword()
           | %{
               optional(:type) => :scalar | :binary | :none | :product | String.t(),
               optional(:subspaces) => pos_integer(),
               optional(:k) => pos_integer()
             }
-  @type db_options :: %{
-          optional(:metric) => metric(),
-          optional(:distance_metric) => metric(),
-          optional(:hnsw) => boolean() | hnsw_options() | keyword(),
-          optional(:quantization) => quantization_options() | keyword()
-        }
+          | %{optional(String.t()) => term()}
+  @type db_options ::
+          %{
+            optional(:metric) => metric(),
+            optional(:distance_metric) => metric(),
+            optional(:hnsw) =>
+              boolean() | hnsw_options() | %{optional(String.t()) => term()} | keyword(),
+            optional(:quantization) => quantization_options()
+          }
+          | %{optional(String.t()) => term()}
   @type entry_map :: %{
           id: String.t(),
           vector: [float()],
@@ -62,10 +67,23 @@ defmodule RuvectorElixir do
               optional(:id) => id_input() | nil,
               optional(:metadata) => map() | nil
             }
+          | %{
+              required(String.t()) => vector() | id_input() | map() | nil
+            }
           | vector()
-  @type search_filter :: map() | keyword() | nil
+  @type search_filter ::
+          %{optional(String.t() | atom()) => term()}
+          | [{String.t() | atom(), term()}]
+          | nil
   @type search_option :: {:filter, search_filter()} | {:ef_search, pos_integer() | nil}
   @type search_detailed_option :: search_option()
+  @type search_options ::
+          [search_option()]
+          | %{
+              optional(:filter) => search_filter(),
+              optional(:ef_search) => pos_integer() | nil
+            }
+          | %{optional(String.t()) => search_filter() | pos_integer() | nil}
   @type search_result :: %{
           id: String.t(),
           score: float(),
@@ -88,6 +106,8 @@ defmodule RuvectorElixir do
 
   @valid_metrics [:cosine, :euclidean, :dot_product, :dot, :manhattan]
   @valid_metric_strings ["cosine", "euclidean", "dot_product", "dotproduct", "dot", "manhattan"]
+  @max_hnsw_elements 10_000_000
+  @max_hnsw_ef 1_000_000
 
   # ============================================================================
   # Database Lifecycle
@@ -97,16 +117,18 @@ defmodule RuvectorElixir do
   Opens or creates a ruvector database at `path` with the specified vector `dimensions` and optional configuration `options`.
 
   Options can be supplied as either a plain map or a keyword list. Invalid option keys or values
-  raise `ArgumentError`.
+  raise `ArgumentError`. When reopening an existing `.rvf` database on disk, `ruvector-core`
+  uses the persisted configuration (`dimensions`, `distance_metric`, `hnsw`, and `quantization`)
+  already stored in the file.
 
   ## Options
 
   - `:metric` / `:distance_metric` - Distance metric to use (`:cosine`, `:euclidean`, `:dot_product`, `:manhattan`). Default: `:cosine`.
   - `:hnsw` - Either a boolean (`true` for default HNSW index parameters, `false` for flat index), or a map/keyword list with:
     - `:m` - Number of bi-directional links created per node (`2..256`, default: `16`).
-    - `:ef_construction` - Size of dynamic candidate list during construction (default: `100`).
-    - `:ef_search` - Size of dynamic candidate list during search (default: `100`).
-    - `:max_elements` - Initial capacity of the graph index (default: `1_000_000`).
+    - `:ef_construction` - Size of dynamic candidate list during construction (`1..1_000_000`, default: `100`).
+    - `:ef_search` - Size of dynamic candidate list during search (`1..1_000_000`, default: `100`).
+    - `:max_elements` - Initial capacity of the graph index (`1..10_000_000`, default: `1_000_000`).
   - `:quantization` - Optional quantization configuration (`:scalar`, `:binary`, `:none`, or `%{type: :product, subspaces: pos_integer(), k: pos_integer()}` where `subspaces` must evenly divide `dimensions`).
     Note: upstream `ruvector-core` 2.3.0 persists and reports `:quantization` in config/info, but stores vectors in `f32` precision without applying compression yet (`ruvnet/RuVector#563`).
 
@@ -121,12 +143,20 @@ defmodule RuvectorElixir do
 
   ## Examples
 
+      iex> {:ok, mem_db} = RuvectorElixir.open("memory://transient", 64)
+      iex> {:ok, %{dimensions: 64}} = RuvectorElixir.info(mem_db)
+      iex> RuvectorElixir.close(mem_db)
+      :ok
+
+  On-disk databases use a filesystem path (close an open handle before reopening the same path):
+
       {:ok, db} = RuvectorElixir.open("my_db.rvf", 128)
-      {:ok, db} = RuvectorElixir.open("my_db.rvf", 128, metric: :euclidean, hnsw: true)
-      {:ok, mem_db} = RuvectorElixir.open("memory://transient", 64)
+      :ok = RuvectorElixir.close(db)
+      {:ok, hnsw_db} = RuvectorElixir.open("hnsw_db.rvf", 128, metric: :euclidean, hnsw: true)
+      :ok = RuvectorElixir.close(hnsw_db)
 
   """
-  @spec open(Path.t(), pos_integer(), db_options() | keyword()) ::
+  @spec open(String.t(), pos_integer(), db_options() | keyword()) ::
           {:ok, db_ref()} | {:error, String.t()}
   def open(path, dimensions, options \\ %{})
 
@@ -134,6 +164,11 @@ defmodule RuvectorElixir do
       when is_binary(path) and byte_size(path) > 0 and is_integer(dimensions) and dimensions > 0 do
     if not String.valid?(path) do
       raise ArgumentError, "Database path must be a valid UTF-8 string"
+    end
+
+    if dimensions > max_usize() do
+      raise ArgumentError,
+            "Database dimensions exceeds maximum platform integer size, got: #{inspect(dimensions)}"
     end
 
     Native.open_db_with_options(path, dimensions, normalize_options!(options, dimensions))
@@ -147,7 +182,7 @@ defmodule RuvectorElixir do
   @doc """
   Opens a database, raising `RuvectorElixir.Error` on operational failure or `ArgumentError` on invalid arguments.
   """
-  @spec open!(Path.t(), pos_integer(), db_options() | keyword()) :: db_ref()
+  @spec open!(String.t(), pos_integer(), db_options() | keyword()) :: db_ref()
   def open!(path, dimensions, options \\ %{}) do
     case open(path, dimensions, options) do
       {:ok, db} -> db
@@ -163,6 +198,7 @@ defmodule RuvectorElixir do
   """
   @spec close(db_ref()) :: :ok | {:error, String.t()}
   def close(db_ref) when is_reference(db_ref), do: Native.close_db(db_ref)
+  def close(db_ref), do: invalid_db_ref!("close/1", db_ref)
 
   @doc """
   Closes a database handle, raising `RuvectorElixir.Error` on failure.
@@ -180,10 +216,10 @@ defmodule RuvectorElixir do
 
   Returns `{:ok, result}` on success, or `{:error, reason}` if `open/3` fails.
   """
-  @spec with_open(Path.t(), pos_integer(), (db_ref() -> result)) ::
+  @spec with_open(String.t(), pos_integer(), (db_ref() -> result)) ::
           {:ok, result} | {:error, String.t()}
         when result: var
-  @spec with_open(Path.t(), pos_integer(), db_options() | keyword(), (db_ref() -> result)) ::
+  @spec with_open(String.t(), pos_integer(), db_options() | keyword(), (db_ref() -> result)) ::
           {:ok, result} | {:error, String.t()}
         when result: var
   def with_open(path, dimensions, fun) when is_function(fun, 1) do
@@ -218,8 +254,8 @@ defmodule RuvectorElixir do
   Opens a database with `open!/3`, passes the handle to `fun`, ensures `close/1` runs,
   and returns the result of `fun` directly.
   """
-  @spec with_open!(Path.t(), pos_integer(), (db_ref() -> result)) :: result when result: var
-  @spec with_open!(Path.t(), pos_integer(), db_options() | keyword(), (db_ref() -> result)) ::
+  @spec with_open!(String.t(), pos_integer(), (db_ref() -> result)) :: result when result: var
+  @spec with_open!(String.t(), pos_integer(), db_options() | keyword(), (db_ref() -> result)) ::
           result
         when result: var
   def with_open!(path, dimensions, fun) when is_function(fun, 1) do
@@ -262,6 +298,7 @@ defmodule RuvectorElixir do
   """
   @spec insert(db_ref(), entry_input()) :: {:ok, String.t()} | {:error, :closed | String.t()}
   def insert(db_ref, entry) when is_reference(db_ref), do: Native.insert(db_ref, entry)
+  def insert(db_ref, _entry), do: invalid_db_ref!("insert/2", db_ref)
 
   @doc """
   Inserts a vector entry into the database, raising `RuvectorElixir.Error` on failure.
@@ -281,9 +318,11 @@ defmodule RuvectorElixir do
   """
   @spec insert_batch(db_ref(), [entry_input()]) ::
           {:ok, [String.t()]} | {:error, :closed | String.t()}
-  def insert_batch(db_ref, entries) when is_reference(db_ref) and is_list(entries) do
+  def insert_batch(db_ref, entries) when is_reference(db_ref) do
     Native.insert_batch(db_ref, entries)
   end
+
+  def insert_batch(db_ref, _entries), do: invalid_db_ref!("insert_batch/2", db_ref)
 
   @doc """
   Inserts a batch of vector entries into the database, raising `RuvectorElixir.Error` on failure.
@@ -306,6 +345,7 @@ defmodule RuvectorElixir do
   @spec get(db_ref(), id_input()) ::
           {:ok, entry_map()} | {:error, :not_found | :closed | String.t()}
   def get(db_ref, id) when is_reference(db_ref), do: Native.get_entry(db_ref, id)
+  def get(db_ref, _id), do: invalid_db_ref!("get/2", db_ref)
 
   @doc """
   Retrieves a vector entry, raising `RuvectorElixir.Error` if not found or if an error occurs.
@@ -348,6 +388,7 @@ defmodule RuvectorElixir do
   """
   @spec delete(db_ref(), id_input()) :: {:ok, boolean()} | {:error, :closed | String.t()}
   def delete(db_ref, id) when is_reference(db_ref), do: Native.delete(db_ref, id)
+  def delete(db_ref, _id), do: invalid_db_ref!("delete/2", db_ref)
 
   @doc """
   Deletes an entry by its ID, raising `RuvectorElixir.Error` on failure.
@@ -365,6 +406,7 @@ defmodule RuvectorElixir do
   """
   @spec len(db_ref()) :: {:ok, non_neg_integer()} | {:error, :closed | String.t()}
   def len(db_ref) when is_reference(db_ref), do: Native.db_len(db_ref)
+  def len(db_ref), do: invalid_db_ref!("len/1", db_ref)
 
   @doc """
   Returns the total number of vectors in the database, raising `RuvectorElixir.Error` on error.
@@ -393,6 +435,7 @@ defmodule RuvectorElixir do
   Checks if the database is empty.
 
   Returns `true` or `false`, raising `RuvectorElixir.Error` on failure (such as `:closed`).
+  Callers needing a non-raising tuple can check `len/1` (matching `{:ok, 0}`).
   """
   @spec empty?(db_ref()) :: boolean()
   def empty?(db_ref) when is_reference(db_ref) do
@@ -402,11 +445,14 @@ defmodule RuvectorElixir do
     end
   end
 
+  def empty?(db_ref), do: invalid_db_ref!("empty?/1", db_ref)
+
   @doc """
   Returns a list of all vector IDs currently stored in the database.
   """
   @spec keys(db_ref()) :: {:ok, [String.t()]} | {:error, :closed | String.t()}
   def keys(db_ref) when is_reference(db_ref), do: Native.all_ids(db_ref)
+  def keys(db_ref), do: invalid_db_ref!("keys/1", db_ref)
 
   @doc """
   Returns all vector IDs in the database, raising `RuvectorElixir.Error` on error.
@@ -433,32 +479,39 @@ defmodule RuvectorElixir do
 
   Returns `{:ok, [id]}` on success, or `{:error, reason}` on failure.
   """
-  @spec search(db_ref(), vector(), non_neg_integer(), [search_option()] | map()) ::
+  @spec search(db_ref(), vector(), non_neg_integer(), search_options()) ::
           {:ok, [String.t()]} | {:error, :closed | String.t()}
   def search(db_ref, query_vector, k, opts \\ [])
 
   def search(db_ref, query_vector, k, opts)
-      when is_reference(db_ref) and is_list(query_vector) and is_integer(k) and k >= 0 do
+      when is_reference(db_ref) and is_list(query_vector) and length(query_vector) >= 0 and
+             is_integer(k) and k >= 0 do
     %{filter: filter, ef_search: ef_search} =
       validate_search_opts!(opts, [:filter, :ef_search])
 
-    Native.search(db_ref, query_vector, filter, k, ef_search)
+    Native.search(db_ref, query_vector, filter, min(k, max_usize()), ef_search)
   end
 
   def search(db_ref, query_vector, k, _opts) do
     raise ArgumentError,
-          "Invalid arguments to RuvectorElixir.search/4: expected db_ref, list vector, and non-negative integer k, got db_ref=#{inspect(db_ref)}, query_vector=#{inspect(query_vector)}, k=#{inspect(k)}"
+          "Invalid arguments to RuvectorElixir.search/4: expected db_ref, proper list vector, and non-negative integer k, got db_ref=#{inspect(db_ref)}, query_vector=#{inspect(query_vector)}, k=#{inspect(k)}"
   end
 
   @doc """
   Searches the database for top `k` closest vectors, raising `RuvectorElixir.Error` on operational
   failure or `ArgumentError` on invalid arguments.
   """
-  @spec search!(db_ref(), vector(), non_neg_integer(), [search_option()] | map()) :: [String.t()]
+  @spec search!(db_ref(), vector(), non_neg_integer(), search_options()) :: [String.t()]
   def search!(db_ref, query_vector, k, opts \\ []) do
     case search(db_ref, query_vector, k, opts) do
-      {:ok, ids} -> ids
-      {:error, reason} -> raise Error, reason
+      {:ok, ids} ->
+        ids
+
+      {:error, reason} when reason in ["Invalid query vector", "Invalid filter format"] ->
+        raise ArgumentError, reason
+
+      {:error, reason} ->
+        raise Error, reason
     end
   end
 
@@ -480,22 +533,23 @@ defmodule RuvectorElixir do
           db_ref(),
           vector(),
           non_neg_integer(),
-          [search_detailed_option()] | map()
+          search_options()
         ) ::
           {:ok, [search_result()]} | {:error, :closed | String.t()}
   def search_detailed(db_ref, query_vector, k, opts \\ [])
 
   def search_detailed(db_ref, query_vector, k, opts)
-      when is_reference(db_ref) and is_list(query_vector) and is_integer(k) and k >= 0 do
+      when is_reference(db_ref) and is_list(query_vector) and length(query_vector) >= 0 and
+             is_integer(k) and k >= 0 do
     %{filter: filter, ef_search: ef_search} =
       validate_search_opts!(opts, [:filter, :ef_search])
 
-    Native.search_detailed(db_ref, query_vector, filter, k, ef_search)
+    Native.search_detailed(db_ref, query_vector, filter, min(k, max_usize()), ef_search)
   end
 
   def search_detailed(db_ref, query_vector, k, _opts) do
     raise ArgumentError,
-          "Invalid arguments to RuvectorElixir.search_detailed/4: expected db_ref, list vector, and non-negative integer k, got db_ref=#{inspect(db_ref)}, query_vector=#{inspect(query_vector)}, k=#{inspect(k)}"
+          "Invalid arguments to RuvectorElixir.search_detailed/4: expected db_ref, proper list vector, and non-negative integer k, got db_ref=#{inspect(db_ref)}, query_vector=#{inspect(query_vector)}, k=#{inspect(k)}"
   end
 
   @doc """
@@ -506,13 +560,19 @@ defmodule RuvectorElixir do
           db_ref(),
           vector(),
           non_neg_integer(),
-          [search_detailed_option()] | map()
+          search_options()
         ) ::
           [search_result()]
   def search_detailed!(db_ref, query_vector, k, opts \\ []) do
     case search_detailed(db_ref, query_vector, k, opts) do
-      {:ok, results} -> results
-      {:error, reason} -> raise Error, reason
+      {:ok, results} ->
+        results
+
+      {:error, reason} when reason in ["Invalid query vector", "Invalid filter format"] ->
+        raise ArgumentError, reason
+
+      {:error, reason} ->
+        raise Error, reason
     end
   end
 
@@ -533,7 +593,8 @@ defmodule RuvectorElixir do
 
   @dirty_distance_threshold 4096
 
-  def distance(a, b, metric) when is_list(a) and a != [] and is_list(b) and b != [] do
+  def distance(a, b, metric)
+      when is_list(a) and length(a) > 0 and is_list(b) and length(b) > 0 do
     validated_metric = validate_metric!(metric)
 
     if length(a) > @dirty_distance_threshold or length(b) > @dirty_distance_threshold do
@@ -544,7 +605,7 @@ defmodule RuvectorElixir do
   end
 
   def distance(_a, _b, _metric) do
-    raise ArgumentError, "RuvectorElixir.distance/3 expects two non-empty lists of numbers"
+    raise ArgumentError, "RuvectorElixir.distance/3 expects two non-empty proper lists of numbers"
   end
 
   @doc """
@@ -554,8 +615,14 @@ defmodule RuvectorElixir do
   @spec distance!(vector(), vector(), metric()) :: float()
   def distance!(a, b, metric \\ :cosine) do
     case distance(a, b, metric) do
-      {:ok, dist} -> dist
-      {:error, reason} -> raise Error, reason
+      {:ok, dist} ->
+        dist
+
+      {:error, reason} when reason in ["Invalid vector a", "Invalid vector b"] ->
+        raise ArgumentError, reason
+
+      {:error, reason} ->
+        raise Error, reason
     end
   end
 
@@ -565,6 +632,7 @@ defmodule RuvectorElixir do
   """
   @spec info(db_ref()) :: {:ok, db_info()} | {:error, :closed | String.t()}
   def info(db_ref) when is_reference(db_ref), do: Native.info(db_ref)
+  def info(db_ref), do: invalid_db_ref!("info/1", db_ref)
 
   @doc """
   Gets database metadata info, raising `RuvectorElixir.Error` on failure.
@@ -696,13 +764,20 @@ defmodule RuvectorElixir do
         raise ArgumentError, "Unknown :hnsw option: #{inspect(hk)}"
       end
 
-      if not (is_integer(hv) and hv > 0) do
-        raise ArgumentError,
-              ":hnsw option :#{hkey} must be a positive integer, got: #{inspect(hv)}"
-      end
+      validate_pos_usize!(hv, ":hnsw option :#{hkey}")
 
       if hkey == "m" and hv not in 2..256 do
         raise ArgumentError, ":hnsw option :m must be between 2 and 256, got: #{inspect(hv)}"
+      end
+
+      if hkey in ["ef_construction", "ef_search"] and hv > @max_hnsw_ef do
+        raise ArgumentError,
+              ":hnsw option :#{hkey} must be between 1 and #{@max_hnsw_ef}, got: #{inspect(hv)}"
+      end
+
+      if hkey == "max_elements" and hv > @max_hnsw_elements do
+        raise ArgumentError,
+              ":hnsw option :max_elements must be between 1 and #{@max_hnsw_elements}, got: #{inspect(hv)}"
       end
 
       Map.put(acc, hkey, hv)
@@ -761,12 +836,7 @@ defmodule RuvectorElixir do
               validate_quantization_type!(qv)
 
             param when param in ["subspaces", "k"] ->
-              if not (is_integer(qv) and qv > 0) do
-                raise ArgumentError,
-                      ":quantization :#{param} must be a positive integer, got: #{inspect(qv)}"
-              end
-
-              qv
+              validate_pos_usize!(qv, ":quantization :#{param}")
 
             _ ->
               raise ArgumentError, "Unknown :quantization option: #{inspect(qk)}"
@@ -836,39 +906,71 @@ defmodule RuvectorElixir do
   defp reduce_search_opts!(enum, allowed_keys) do
     acc =
       Enum.reduce(enum, %{seen: MapSet.new(), filter: nil, ef_search: nil}, fn {k, v}, acc ->
-        if k not in allowed_keys do
-          raise ArgumentError,
-                "Unknown search option #{inspect(k)}; allowed options: #{inspect(allowed_keys)}"
+        key = normalize_search_opt_key!(k, allowed_keys)
+
+        if MapSet.member?(acc.seen, key) do
+          raise ArgumentError, "Duplicate search option: #{inspect(key)}"
         end
 
-        if MapSet.member?(acc.seen, k) do
-          raise ArgumentError, "Duplicate search option: #{inspect(k)}"
-        end
-
-        case k do
+        case key do
           :filter ->
             validate_filter!(v)
 
           :ef_search ->
-            if v != nil and not (is_integer(v) and v > 0) do
-              raise ArgumentError,
-                    ":ef_search must be a positive integer or nil, got: #{inspect(v)}"
+            if not is_nil(v) do
+              validate_pos_usize!(v, ":ef_search")
             end
         end
 
         acc
-        |> Map.put(k, v)
-        |> Map.update!(:seen, &MapSet.put(&1, k))
+        |> Map.put(key, v)
+        |> Map.update!(:seen, &MapSet.put(&1, key))
       end)
 
     %{filter: acc.filter, ef_search: acc.ef_search}
   end
 
+  defp normalize_search_opt_key!(k, allowed_keys) when is_atom(k) do
+    if k in allowed_keys do
+      k
+    else
+      raise ArgumentError,
+            "Unknown search option #{inspect(k)}; allowed options: #{inspect(allowed_keys)}"
+    end
+  end
+
+  defp normalize_search_opt_key!(k, allowed_keys) when is_binary(k) do
+    key =
+      case k do
+        "filter" -> :filter
+        "ef_search" -> :ef_search
+        _ -> nil
+      end
+
+    if key != nil and key in allowed_keys do
+      key
+    else
+      raise ArgumentError,
+            "Unknown search option #{inspect(k)}; allowed options: #{inspect(allowed_keys)}"
+    end
+  end
+
+  defp normalize_search_opt_key!(k, allowed_keys) do
+    raise ArgumentError,
+          "Unknown search option #{inspect(k)}; allowed options: #{inspect(allowed_keys)}"
+  end
+
   defp validate_filter!(nil), do: :ok
 
   defp validate_filter!(%{} = filter)
-       when not is_struct(filter) and not is_map_key(filter, :__struct__),
-       do: :ok
+       when not is_struct(filter) and not is_map_key(filter, :__struct__) do
+    if Enum.all?(Map.keys(filter), &valid_filter_key?/1) do
+      :ok
+    else
+      raise ArgumentError,
+            ":filter map keys must be valid UTF-8 strings or non-boolean atoms, got: #{inspect(filter)}"
+    end
+  end
 
   defp validate_filter!(filter) when is_list(filter) do
     if valid_filter_list?(filter) do
@@ -884,16 +986,41 @@ defmodule RuvectorElixir do
           ":filter must be a plain map, keyword list, or nil, got: #{inspect(other)}"
   end
 
+  defp valid_filter_key?(k) when is_binary(k), do: String.valid?(k)
+
+  defp valid_filter_key?(k)
+       when is_atom(k) and not is_boolean(k) and not is_nil(k) and k != :__struct__,
+       do: true
+
+  defp valid_filter_key?(_other), do: false
+
   defp valid_filter_list?([]), do: true
 
-  defp valid_filter_list?([{k, _v} | rest]) when is_binary(k) do
-    String.valid?(k) and valid_filter_list?(rest)
-  end
-
-  defp valid_filter_list?([{k, _v} | rest])
-       when is_atom(k) and not is_boolean(k) and not is_nil(k) and k != :__struct__ do
-    valid_filter_list?(rest)
+  defp valid_filter_list?([{k, _v} | rest]) do
+    valid_filter_key?(k) and valid_filter_list?(rest)
   end
 
   defp valid_filter_list?(_other), do: false
+
+  defp max_usize do
+    Bitwise.bsl(1, :erlang.system_info(:wordsize) * 8) - 1
+  end
+
+  defp validate_pos_usize!(val, label) when is_integer(val) and val > 0 do
+    if val > max_usize() do
+      raise ArgumentError, "#{label} exceeds maximum platform integer size, got: #{inspect(val)}"
+    end
+
+    val
+  end
+
+  defp validate_pos_usize!(val, label) do
+    raise ArgumentError, "#{label} must be a positive integer, got: #{inspect(val)}"
+  end
+
+  @spec invalid_db_ref!(String.t(), term()) :: no_return()
+  defp invalid_db_ref!(fun_name, db_ref) do
+    raise ArgumentError,
+          "Invalid arguments to RuvectorElixir.#{fun_name}: expected db_ref, got db_ref=#{inspect(db_ref)}"
+  end
 end

@@ -8,6 +8,7 @@ defmodule RuvectorElixir.EdgeCasesTest do
   setup %{tmp_dir: tmp_dir} do
     db_path = Path.join(tmp_dir, "ruvector_edge.rvf")
     {:ok, db} = RuvectorElixir.open(db_path, 4)
+    on_exit(fn -> RuvectorElixir.close(db) end)
     {:ok, db: db, db_path: db_path, tmp_dir: tmp_dir}
   end
 
@@ -95,6 +96,8 @@ defmodule RuvectorElixir.EdgeCasesTest do
 
       assert {:ok, db} =
                RuvectorElixir.open(custom_path, 16, %{metric: :manhattan, hnsw: true})
+
+      on_exit(fn -> RuvectorElixir.close(db) end)
 
       assert {:ok, info} = RuvectorElixir.info(db)
       assert info.dimensions == 16
@@ -262,7 +265,10 @@ defmodule RuvectorElixir.EdgeCasesTest do
                })
 
       assert {:error, "Vector batch must be a list"} =
-               RuvectorElixir.Native.insert_batch(db, :not_a_list)
+               RuvectorElixir.insert_batch(db, :not_a_list)
+
+      assert {:error, "Vector batch must be a list"} =
+               RuvectorElixir.insert_batch(db, [[1.0, 2.0, 3.0, 4.0] | :bad])
     end
 
     test "rejects malformed search filters instead of running unfiltered queries", %{db: db} do
@@ -296,6 +302,9 @@ defmodule RuvectorElixir.EdgeCasesTest do
             [__struct__: Date],
             [{<<0xFF, 0xFE>>, "x"}],
             [{:a, 1} | :bad],
+            [{:a, 1} | {:b, 2}],
+            [{1, "a"}],
+            %{1 => "a"},
             %{__struct__: "fake"}
           ] do
         assert_raise ArgumentError, fn ->
@@ -306,6 +315,19 @@ defmodule RuvectorElixir.EdgeCasesTest do
           RuvectorElixir.search_detailed(db, [1.0, 0.0, 0.0, 0.0], 5, filter: invalid_filter)
         end
       end
+
+      assert {:error, "Invalid filter format"} =
+               RuvectorElixir.Native.search(db, [1.0, 0.0, 0.0, 0.0], %{1 => "a"}, 5, nil)
+
+      assert {:error, "Invalid filter format"} =
+               RuvectorElixir.Native.search(db, [1.0, 0.0, 0.0, 0.0], [{1, "a"}], 5, nil)
+
+      assert {:error, "Invalid vector entry format"} =
+               RuvectorElixir.insert(db, %{
+                 id: "int_key_meta",
+                 vector: [1.0, 0.0, 0.0, 0.0],
+                 metadata: %{1 => "a"}
+               })
 
       assert {:error, "Invalid filter format"} =
                RuvectorElixir.search(db, [1.0, 0.0, 0.0, 0.0], 5,
@@ -320,6 +342,47 @@ defmodule RuvectorElixir.EdgeCasesTest do
       # Unsupported values inside an otherwise valid filter map return an error from NIF
       assert {:error, "Invalid filter format"} =
                RuvectorElixir.search(db, [1.0, 0.0, 0.0, 0.0], 5, filter: %{"bad" => {:tuple}})
+    end
+
+    test "enforces symmetric 127-level JSON container nesting across metadata, map filters, and list filters",
+         %{db: db} do
+      depth_127_map = Enum.reduce(1..127, "leaf", fn _, acc -> %{"n" => acc} end)
+      depth_128_map = Enum.reduce(1..128, "leaf", fn _, acc -> %{"n" => acc} end)
+      depth_128_list_leaf = Enum.reduce(1..127, [], fn _, acc -> %{"n" => acc} end)
+      depth_127_kw = [n: Enum.reduce(1..126, "leaf", fn _, acc -> %{"n" => acc} end)]
+      depth_128_kw = [n: Enum.reduce(1..127, "leaf", fn _, acc -> %{"n" => acc} end)]
+
+      entry_127 =
+        VectorEntry.new([1.0, 0.0, 0.0, 0.0], id: "deep_127", metadata: depth_127_map)
+
+      assert {:ok, "deep_127"} = RuvectorElixir.insert(db, entry_127)
+      assert {:ok, fetched} = RuvectorElixir.get(db, "deep_127")
+      assert fetched.metadata == depth_127_map
+
+      assert {:ok, ["deep_127"]} =
+               RuvectorElixir.search(db, [1.0, 0.0, 0.0, 0.0], 5, filter: depth_127_map)
+
+      assert {:ok, ["deep_127"]} =
+               RuvectorElixir.search(db, [1.0, 0.0, 0.0, 0.0], 5, filter: depth_127_kw)
+
+      for too_deep <- [depth_128_map, depth_128_list_leaf] do
+        assert_raise ArgumentError, ~r/depth/, fn ->
+          VectorEntry.new([1.0, 0.0, 0.0, 0.0], id: "too_deep", metadata: too_deep)
+        end
+
+        assert {:error, "Invalid vector entry format"} =
+                 RuvectorElixir.insert(db, %{
+                   id: "too_deep",
+                   vector: [1.0, 0.0, 0.0, 0.0],
+                   metadata: too_deep
+                 })
+
+        assert {:error, "Invalid filter format"} =
+                 RuvectorElixir.search(db, [1.0, 0.0, 0.0, 0.0], 5, filter: too_deep)
+      end
+
+      assert {:error, "Invalid filter format"} =
+               RuvectorElixir.search(db, [1.0, 0.0, 0.0, 0.0], 5, filter: depth_128_kw)
     end
 
     test "rejects invalid open/3 options strictly", %{db: db, tmp_dir: tmp_dir} do
@@ -437,6 +500,145 @@ defmodule RuvectorElixir.EdgeCasesTest do
 
       assert_raise ArgumentError, fn ->
         RuvectorElixir.open(db_path, 4, quantization: %{type: :product, subspaces: 3, k: 256})
+      end
+
+      too_big_usize = Bitwise.bsl(1, :erlang.system_info(:wordsize) * 8)
+
+      assert_raise ArgumentError, ~r/exceeds maximum platform integer size/, fn ->
+        RuvectorElixir.open(db_path, too_big_usize)
+      end
+
+      for hnsw_key <- [:ef_construction, :ef_search, :max_elements] do
+        assert_raise ArgumentError, ~r/exceeds maximum platform integer size/, fn ->
+          RuvectorElixir.open(db_path, 4, hnsw: [{hnsw_key, too_big_usize}])
+        end
+      end
+
+      assert_raise ArgumentError, ~r/exceeds maximum platform integer size/, fn ->
+        RuvectorElixir.open(db_path, 4, quantization: [type: :product, subspaces: too_big_usize])
+      end
+
+      assert_raise ArgumentError, ~r/exceeds maximum platform integer size/, fn ->
+        RuvectorElixir.open(db_path, 4,
+          quantization: [type: :product, subspaces: 2, k: too_big_usize]
+        )
+      end
+
+      assert_raise ArgumentError, ~r/exceeds maximum platform integer size/, fn ->
+        RuvectorElixir.search(db, [1.0, 0.0, 0.0, 0.0], 5, ef_search: too_big_usize)
+      end
+
+      assert_raise ArgumentError, ~r/exceeds maximum platform integer size/, fn ->
+        RuvectorElixir.search_detailed(db, [1.0, 0.0, 0.0, 0.0], 5, ef_search: too_big_usize)
+      end
+
+      assert_raise ArgumentError, ~r/between 1 and 10000000/, fn ->
+        RuvectorElixir.open(db_path, 4, hnsw: [max_elements: 10_000_001])
+      end
+
+      assert_raise ArgumentError, ~r/between 1 and 10000000/, fn ->
+        RuvectorElixir.open(db_path, 4, hnsw: [max_elements: Bitwise.bsl(1, 50)])
+      end
+
+      for ef_key <- [:ef_construction, :ef_search] do
+        assert_raise ArgumentError, ~r/between 1 and 1000000/, fn ->
+          RuvectorElixir.open(db_path, 4, hnsw: [{ef_key, 1_000_001}])
+        end
+      end
+
+      # Direct Native.open_db_with_options enforces HNSW upper bounds and duplicate option checks
+      assert {:error, reason} =
+               RuvectorElixir.Native.open_db_with_options(db_path, 4, %{
+                 "hnsw" => %{"max_elements" => 10_000_001}
+               })
+
+      assert String.contains?(reason, "max_elements")
+
+      assert {:error, ef_reason} =
+               RuvectorElixir.Native.open_db_with_options(db_path, 4, %{
+                 "hnsw" => %{"ef_construction" => 1_000_001}
+               })
+
+      assert String.contains?(ef_reason, "ef_construction")
+
+      for dup_opts <- [
+            %{:hnsw => true, "hnsw" => false},
+            %{:quantization => :scalar, "quantization" => :none},
+            %{"hnsw" => %{:m => 16, "m" => 32}},
+            %{"hnsw" => %{:ef_search => 32, "ef_search" => 64}},
+            %{"hnsw" => %{:ef_construction => 50, "ef_construction" => 100}},
+            %{"hnsw" => %{:max_elements => 100, "max_elements" => 200}}
+          ] do
+        assert {:error, dup_reason} =
+                 RuvectorElixir.Native.open_db_with_options(db_path, 4, dup_opts)
+
+        assert String.contains?(dup_reason, "Duplicate")
+      end
+    end
+
+    test "search! and search_detailed! raise ArgumentError on invalid vectors/filters and Error on operational failures",
+         %{db: db, tmp_dir: tmp_dir} do
+      assert_raise ArgumentError, ~r/Invalid query vector/, fn ->
+        RuvectorElixir.search!(db, ["bad"], 5)
+      end
+
+      assert_raise ArgumentError, ~r/Invalid query vector/, fn ->
+        RuvectorElixir.search_detailed!(db, [1.0e100, 0.0, 0.0, 0.0], 5)
+      end
+
+      assert_raise ArgumentError, ~r/Invalid filter format/, fn ->
+        RuvectorElixir.search!(db, [1.0, 0.0, 0.0, 0.0], 5, filter: %{"bad" => {:tuple}})
+      end
+
+      assert_raise ArgumentError, ~r/Invalid filter format/, fn ->
+        RuvectorElixir.search_detailed!(db, [1.0, 0.0, 0.0, 0.0], 5, filter: %{"bad" => {:tuple}})
+      end
+
+      assert_raise Error, ~r/Dimension mismatch/, fn ->
+        RuvectorElixir.search!(db, [1.0, 2.0], 5)
+      end
+
+      {:ok, closable} = RuvectorElixir.open(Path.join(tmp_dir, "bang_closed.rvf"), 4)
+      :ok = RuvectorElixir.close(closable)
+
+      assert_raise Error, ~r/closed/i, fn ->
+        RuvectorElixir.search!(closable, [1.0, 0.0, 0.0, 0.0], 5)
+      end
+
+      assert_raise Error, ~r/closed/i, fn ->
+        RuvectorElixir.search_detailed!(closable, [1.0, 0.0, 0.0, 0.0], 5)
+      end
+    end
+
+    test "non-reference db_ref raises ArgumentError consistently across handle APIs" do
+      calls = [
+        {:close, [:not_a_ref]},
+        {:close!, [:not_a_ref]},
+        {:insert, [:not_a_ref, [1.0, 0.0, 0.0, 0.0]]},
+        {:insert!, [:not_a_ref, [1.0, 0.0, 0.0, 0.0]]},
+        {:insert_batch, [:not_a_ref, []]},
+        {:insert_batch!, [:not_a_ref, []]},
+        {:get, [:not_a_ref, "id"]},
+        {:get!, [:not_a_ref, "id"]},
+        {:get_struct, [:not_a_ref, "id"]},
+        {:get_struct!, [:not_a_ref, "id"]},
+        {:delete, [:not_a_ref, "id"]},
+        {:delete!, [:not_a_ref, "id"]},
+        {:len, [:not_a_ref]},
+        {:len!, [:not_a_ref]},
+        {:count, [:not_a_ref]},
+        {:count!, [:not_a_ref]},
+        {:empty?, [:not_a_ref]},
+        {:keys, [:not_a_ref]},
+        {:keys!, [:not_a_ref]},
+        {:info, [:not_a_ref]},
+        {:info!, [:not_a_ref]}
+      ]
+
+      for {fun, args} <- calls do
+        assert_raise ArgumentError, ~r/expected db_ref/, fn ->
+          apply(RuvectorElixir, fun, args)
+        end
       end
     end
 
@@ -564,13 +766,154 @@ defmodule RuvectorElixir.EdgeCasesTest do
         VectorEntry.new([1.0, 2.0], metadata: ~D[2026-01-01])
       end
 
+      assert_raise ArgumentError, ~r/Duplicate VectorEntry option/, fn ->
+        VectorEntry.new([1.0, 2.0], %{:id => nil, "id" => 3.14})
+      end
+
       assert_raise ArgumentError, fn ->
         VectorEntry.from_map(%{:id => nil, "id" => "doc_1", :vector => [1.0, 2.0]})
+      end
+
+      assert_raise ArgumentError, fn ->
+        VectorEntry.from_map(%{:vector => nil, "vector" => [1.0, 2.0]})
+      end
+
+      assert_raise ArgumentError, fn ->
+        VectorEntry.from_map(%{:vector => [1.0, 2.0], "vector" => "bad"})
+      end
+
+      assert_raise ArgumentError, fn ->
+        VectorEntry.from_map(%{
+          :metadata => nil,
+          "metadata" => %{"a" => 1},
+          :vector => [1.0, 2.0]
+        })
+      end
+
+      assert_raise ArgumentError, fn ->
+        VectorEntry.new([1.0 | 2.0])
+      end
+
+      assert_raise ArgumentError, fn ->
+        VectorEntry.from_map(%{vector: [1.0 | 2.0]})
+      end
+
+      for bad_meta <- [
+            %{"bad" => {:tuple}},
+            %{"bad" => self()},
+            %{"bad" => <<0xFF, 0xFE>>},
+            %{:a => 1, "a" => 2},
+            %{__struct__: "fake"},
+            %{"nested" => ~D[2026-01-01]},
+            %{"list" => [1 | 2]},
+            %{"big" => Bitwise.bsl(1, 65)},
+            %{1 => "int_key"},
+            Enum.reduce(1..128, "leaf", fn _, acc -> %{"n" => acc} end),
+            Enum.reduce(1..127, [], fn _, acc -> %{"n" => acc} end)
+          ] do
+        assert_raise ArgumentError, fn ->
+          VectorEntry.new([1.0, 2.0], metadata: bad_meta)
+        end
+
+        assert_raise ArgumentError, fn ->
+          VectorEntry.from_map(%{vector: [1.0, 2.0], metadata: bad_meta})
+        end
       end
 
       entry = VectorEntry.from_map(%{id: 42, vector: [1.0, 2.0], metadata: nil})
       assert entry.id == "42"
       assert entry.vector == [1.0, 2.0]
+    end
+
+    test "handles large u128-range integers consistently and rejects improper lists across entry/search APIs",
+         %{tmp_dir: tmp_dir} do
+      big_int = 10_000_000_000_000_000_000
+      big_entry = VectorEntry.new([big_int, 0, 0, 0], id: "big_struct")
+
+      for metric <- [:cosine, :dot_product, :manhattan] do
+        {:ok, handle} = RuvectorElixir.open("memory://big_int_#{metric}", 4, metric: metric)
+
+        assert {:ok, "big_raw"} =
+                 RuvectorElixir.insert(handle, %{id: "big_raw", vector: [big_int, 0, 0, 0]})
+
+        assert {:ok, "big_struct"} = RuvectorElixir.insert(handle, big_entry)
+        assert {:ok, ids} = RuvectorElixir.search(handle, [big_int, 0, 0, 0], 5)
+        assert Enum.sort(ids) == ["big_raw", "big_struct"]
+
+        assert :ok = RuvectorElixir.close(handle)
+      end
+
+      {:ok, db} = RuvectorElixir.open(Path.join(tmp_dir, "improper_lists.rvf"), 4)
+
+      assert_raise ArgumentError, fn ->
+        RuvectorElixir.search(db, [1.0 | 2.0], 5)
+      end
+
+      assert_raise ArgumentError, fn ->
+        RuvectorElixir.search_detailed(db, [1.0 | 2.0], 5)
+      end
+
+      assert {:error, "Invalid vector entry format"} =
+               RuvectorElixir.insert(db, [1.0 | 2.0])
+
+      assert {:error, "Invalid vector entry format"} =
+               RuvectorElixir.insert(db, %{
+                 id: "bad_meta_list",
+                 vector: [1.0, 0.0, 0.0, 0.0],
+                 metadata: %{"bad" => [1 | 2]}
+               })
+
+      assert {:error, "Invalid vector entry in batch"} =
+               RuvectorElixir.insert_batch(db, [[1.0 | 2.0]])
+
+      assert :ok = RuvectorElixir.close(db)
+    end
+
+    test "rejects f32-distance-overflowing vectors before inserting or searching so DBs cannot be poisoned",
+         %{tmp_dir: tmp_dir} do
+      overflow_vec = [1.0e20, 1.0e20, 1.0e20, 1.0e20]
+      manhattan_overflow = [3.0e38, 0.0, 0.0, 0.0]
+
+      for {metric, bad_vec} <- [
+            {:cosine, overflow_vec},
+            {:euclidean, overflow_vec},
+            {:dot_product, overflow_vec},
+            {:manhattan, manhattan_overflow}
+          ],
+          hnsw_opt <- [false, true],
+          backend <- [:memory, :disk] do
+        path =
+          case backend do
+            :memory -> "memory://poison_#{metric}_#{hnsw_opt}"
+            :disk -> Path.join(tmp_dir, "poison_#{metric}_#{hnsw_opt}.rvf")
+          end
+
+        {:ok, handle} = RuvectorElixir.open(path, 4, metric: metric, hnsw: hnsw_opt)
+
+        assert {:ok, "good"} =
+                 RuvectorElixir.insert(handle, %{id: "good", vector: [1.0, 0.0, 0.0, 0.0]})
+
+        assert {:error, reason} =
+                 RuvectorElixir.insert(handle, %{id: "bad", vector: bad_vec})
+
+        assert String.contains?(reason, "magnitude")
+
+        assert {:error, batch_reason} =
+                 RuvectorElixir.insert_batch(handle, [
+                   %{id: "other_good", vector: [0.0, 1.0, 0.0, 0.0]},
+                   %{id: "bad_batch", vector: bad_vec}
+                 ])
+
+        assert String.contains?(batch_reason, "magnitude")
+        assert {:ok, 1} = RuvectorElixir.len(handle)
+
+        assert {:error, query_reason} = RuvectorElixir.search(handle, bad_vec, 5)
+        assert String.contains?(query_reason, "magnitude")
+
+        assert {:ok, ["good"]} = RuvectorElixir.search(handle, [1.0, 0.0, 0.0, 0.0], 5)
+
+        assert :ok = RuvectorElixir.close(handle)
+      end
     end
 
     test "HNSW search recovers live vectors past tombstones and selective filters", %{
@@ -680,6 +1023,63 @@ defmodule RuvectorElixir.EdgeCasesTest do
         assert {:ok, true} = RuvectorElixir.delete(db, "dup")
         assert {:ok, 1} = RuvectorElixir.len(db)
         assert {:ok, ["other"]} = RuvectorElixir.search(db, v1, 5)
+
+        assert :ok = RuvectorElixir.close(db)
+      end
+    end
+
+    test "persistent Flat and HNSW search reflects updated vectors after single and batch upserts",
+         %{tmp_dir: tmp_dir} do
+      for hnsw_opt <- [false, [m: 16, ef_search: 32]] do
+        db_path = Path.join(tmp_dir, "upsert_search_#{inspect(hnsw_opt != false)}.rvf")
+        assert {:ok, db} = RuvectorElixir.open(db_path, 4, metric: :euclidean, hnsw: hnsw_opt)
+
+        assert {:ok, "dup_id"} =
+                 RuvectorElixir.insert(db, %{
+                   id: "dup_id",
+                   vector: [10.0, 0.0, 0.0, 0.0],
+                   metadata: %{"rev" => 1}
+                 })
+
+        assert {:ok, "other"} =
+                 RuvectorElixir.insert(db, %{
+                   id: "other",
+                   vector: [9.0, 0.0, 0.0, 0.0],
+                   metadata: %{"rev" => 0}
+                 })
+
+        # Single-insert upsert moves "dup_id" away from [10, 0, 0, 0] to [0, 10, 0, 0]
+        assert {:ok, "dup_id"} =
+                 RuvectorElixir.insert(db, %{
+                   id: "dup_id",
+                   vector: [0.0, 10.0, 0.0, 0.0],
+                   metadata: %{"rev" => 2}
+                 })
+
+        assert {:ok, [first, second]} =
+                 RuvectorElixir.search_detailed(db, [10.0, 0.0, 0.0, 0.0], 2)
+
+        assert first.id == "other"
+        assert_in_delta first.score, 1.0, 0.01
+        assert second.id == "dup_id"
+        assert second.vector == [0.0, 10.0, 0.0, 0.0]
+        assert second.metadata == %{"rev" => 2}
+        assert_in_delta second.score, :math.sqrt(200.0), 0.01
+
+        # Batch upsert moves "dup_id" right onto [10, 0, 0, 0]
+        assert {:ok, ["dup_id"]} =
+                 RuvectorElixir.insert_batch(db, [
+                   %{id: "dup_id", vector: [10.0, 0.0, 0.0, 0.0], metadata: %{"rev" => 3}}
+                 ])
+
+        assert {:ok, [now_first, now_second]} =
+                 RuvectorElixir.search_detailed(db, [10.0, 0.0, 0.0, 0.0], 2)
+
+        assert now_first.id == "dup_id"
+        assert_in_delta now_first.score, 0.0, 0.01
+        assert now_first.metadata == %{"rev" => 3}
+        assert now_second.id == "other"
+        assert_in_delta now_second.score, 1.0, 0.01
 
         assert :ok = RuvectorElixir.close(db)
       end

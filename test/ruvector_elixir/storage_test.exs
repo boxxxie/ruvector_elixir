@@ -8,6 +8,7 @@ defmodule RuvectorElixir.StorageTest do
   setup %{tmp_dir: tmp_dir} do
     db_path = Path.join(tmp_dir, "ruvector_storage.rvf")
     {:ok, db} = RuvectorElixir.open(db_path, 3)
+    on_exit(fn -> RuvectorElixir.close(db) end)
     {:ok, db: db, db_path: db_path}
   end
 
@@ -204,6 +205,29 @@ defmodule RuvectorElixir.StorageTest do
       assert_raise Error, ~r/not found/i, fn ->
         RuvectorElixir.get_struct!(db, "nonexistent")
       end
+
+      atom_meta_entry =
+        VectorEntry.new([1.0, 2.0, 3.0],
+          id: :doc_rt,
+          metadata: %{
+            status: :published,
+            ok: true,
+            empty: nil,
+            tags: [:a, :b],
+            nested: %{role: :admin}
+          }
+        )
+
+      assert atom_meta_entry.metadata == %{
+               "status" => "published",
+               "ok" => true,
+               "empty" => nil,
+               "tags" => ["a", "b"],
+               "nested" => %{"role" => "admin"}
+             }
+
+      assert {:ok, "doc_rt"} = RuvectorElixir.insert(db, atom_meta_entry)
+      assert RuvectorElixir.get_struct!(db, :doc_rt) == atom_meta_entry
     end
 
     test "bang variants (insert!, insert_batch!, get!, delete!, len!, keys!, info!)", %{db: db} do

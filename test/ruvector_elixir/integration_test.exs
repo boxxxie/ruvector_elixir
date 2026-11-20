@@ -20,6 +20,7 @@ defmodule RuvectorElixir.IntegrationTest do
       }
 
       assert {:ok, db} = RuvectorElixir.open(db_path, 128, options)
+      on_exit(fn -> RuvectorElixir.close(db) end)
 
       entries =
         for i <- 0..99 do
@@ -68,6 +69,7 @@ defmodule RuvectorElixir.IntegrationTest do
       assert :ok = RuvectorElixir.close(db1)
 
       assert {:ok, db2} = RuvectorElixir.open(db_path, 3)
+      on_exit(fn -> RuvectorElixir.close(db2) end)
       assert {:ok, 10} = RuvectorElixir.len(db2)
 
       assert {:ok, entry5} = RuvectorElixir.get(db2, "vec_5")
@@ -78,9 +80,57 @@ defmodule RuvectorElixir.IntegrationTest do
       assert hd(results) == "vec_5"
     end
 
+    test "reopening .rvf database preserves persisted metric, HNSW, quantization, and dimensions even when omitted or mismatched",
+         %{tmp_dir: tmp_dir} do
+      db_path = Path.join(tmp_dir, "ruvector_reopen_opts.rvf")
+
+      assert {:ok, db1} =
+               RuvectorElixir.open(db_path, 8,
+                 metric: :euclidean,
+                 hnsw: [m: 8, ef_search: 32],
+                 quantization: :scalar
+               )
+
+      assert {:ok, "v1"} =
+               RuvectorElixir.insert(db1, %{
+                 id: "v1",
+                 vector: [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]
+               })
+
+      assert :ok = RuvectorElixir.close(db1)
+
+      # Reopen with omitted options
+      assert {:ok, db2} = RuvectorElixir.open(db_path, 8)
+      assert {:ok, info2} = RuvectorElixir.info(db2)
+      assert info2.dimensions == 8
+      assert info2.distance_metric == :euclidean
+      assert info2.hnsw.m == 8
+      assert info2.hnsw.ef_search == 32
+      assert info2.quantization == :scalar
+
+      assert {:ok, ["v1"]} =
+               RuvectorElixir.search(db2, [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0], 1)
+
+      assert :ok = RuvectorElixir.close(db2)
+
+      # Reopen with mismatched dimensions -> persisted 8D config still wins
+      assert {:ok, db3} = RuvectorElixir.open(db_path, 99)
+      on_exit(fn -> RuvectorElixir.close(db3) end)
+      assert {:ok, info3} = RuvectorElixir.info(db3)
+      assert info3.dimensions == 8
+      assert info3.distance_metric == :euclidean
+      assert info3.quantization == :scalar
+      assert {:ok, entry} = RuvectorElixir.get(db3, "v1")
+      assert entry.id == "v1"
+
+      assert {:ok, ["v1"]} =
+               RuvectorElixir.search(db3, [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0], 1)
+    end
+
     test "mixed operations: batch insert, deletions, single inserts, search", %{tmp_dir: tmp_dir} do
       db_path = Path.join(tmp_dir, "ruvector_mixed.rvf")
       assert {:ok, db} = RuvectorElixir.open(db_path, 64)
+      on_exit(fn -> RuvectorElixir.close(db) end)
 
       initial =
         for i <- 0..49 do
@@ -139,6 +189,7 @@ defmodule RuvectorElixir.IntegrationTest do
 
         scores = Enum.map(detailed, & &1.score)
         assert scores == Enum.sort(scores), "Scores not sorted ascending for #{metric}"
+        assert :ok = RuvectorElixir.close(db)
       end
     end
 
@@ -166,12 +217,14 @@ defmodule RuvectorElixir.IntegrationTest do
         query = for j <- 0..63, do: j * 0.01
         assert {:ok, results} = RuvectorElixir.search(db, query, 10)
         assert length(results) == 10
+        assert :ok = RuvectorElixir.close(db)
       end
     end
 
     test "dimension validation on insert", %{tmp_dir: tmp_dir} do
       db_path = Path.join(tmp_dir, "ruvector_dim_val.rvf")
       assert {:ok, db} = RuvectorElixir.open(db_path, 64)
+      on_exit(fn -> RuvectorElixir.close(db) end)
 
       assert {:error, reason} = RuvectorElixir.insert(db, [1.0, 2.0, 3.0])
       assert String.contains?(reason, "mismatch") or String.contains?(reason, "Dimension")
@@ -181,6 +234,7 @@ defmodule RuvectorElixir.IntegrationTest do
          %{tmp_dir: tmp_dir} do
       db_path = Path.join(tmp_dir, "ruvector_search_dim.rvf")
       assert {:ok, db} = RuvectorElixir.open(db_path, 64)
+      on_exit(fn -> RuvectorElixir.close(db) end)
       assert {:ok, _} = RuvectorElixir.insert(db, %{id: "v1", vector: List.duplicate(0.5, 64)})
 
       query = [1.0, 2.0, 3.0]
@@ -204,6 +258,8 @@ defmodule RuvectorElixir.IntegrationTest do
           hnsw: [m: 16, ef_construction: 50, ef_search: 50]
         )
 
+      on_exit(fn -> RuvectorElixir.close(db) end)
+
       assert {:ok, info} = RuvectorElixir.info(db)
       assert info.dimensions == 32
       assert info.distance_metric == :euclidean
@@ -217,6 +273,7 @@ defmodule RuvectorElixir.IntegrationTest do
 
     test "memory:// URI opens genuine in-memory database", %{} do
       assert {:ok, mem_db} = RuvectorElixir.open("memory://integration", 16, metric: :cosine)
+      on_exit(fn -> RuvectorElixir.close(mem_db) end)
 
       assert {:ok, info} = RuvectorElixir.info(mem_db)
       assert info.dimensions == 16
@@ -240,6 +297,7 @@ defmodule RuvectorElixir.IntegrationTest do
         assert {:ok, 1} = RuvectorElixir.len(db)
         assert {:ok, info} = RuvectorElixir.info(db)
         assert info.quantization == q
+        assert :ok = RuvectorElixir.close(db)
       end
 
       pq_path = Path.join(tmp_dir, "ruvector_quant_product.rvf")
@@ -248,6 +306,8 @@ defmodule RuvectorElixir.IntegrationTest do
                RuvectorElixir.open(pq_path, 16,
                  quantization: %{type: :product, subspaces: 8, k: 256}
                )
+
+      on_exit(fn -> RuvectorElixir.close(pq_db) end)
 
       assert {:ok, _id} = RuvectorElixir.insert(pq_db, List.duplicate(1.0, 16))
       assert {:ok, info} = RuvectorElixir.info(pq_db)
@@ -259,6 +319,7 @@ defmodule RuvectorElixir.IntegrationTest do
     } do
       db_path = Path.join(tmp_dir, "ruvector_1k.rvf")
       assert {:ok, db} = RuvectorElixir.open(db_path, 128, hnsw: true)
+      on_exit(fn -> RuvectorElixir.close(db) end)
 
       entries =
         for i <- 0..999 do

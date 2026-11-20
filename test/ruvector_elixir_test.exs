@@ -1,12 +1,14 @@
 defmodule RuvectorElixirTest do
   use ExUnit.Case, async: true
 
+  doctest RuvectorElixir
   doctest RuvectorElixir.VectorEntry
 
   @tag :tmp_dir
   test "can open a database and search", %{tmp_dir: tmp_dir} do
     db_path = Path.join(tmp_dir, "ruvector_test.rvf")
     assert {:ok, db_ref} = RuvectorElixir.open(db_path, 768)
+    on_exit(fn -> RuvectorElixir.close(db_ref) end)
     assert {:ok, 0} = RuvectorElixir.len(db_ref)
 
     query_vector = List.duplicate(0.1, 768)
@@ -17,6 +19,7 @@ defmodule RuvectorElixirTest do
   test "search/4 accepts filter and works on empty DB", %{tmp_dir: tmp_dir} do
     db_path = Path.join(tmp_dir, "ruvector_filter_empty.rvf")
     assert {:ok, db_ref} = RuvectorElixir.open(db_path, 768)
+    on_exit(fn -> RuvectorElixir.close(db_ref) end)
     query_vector = List.duplicate(0.1, 768)
 
     assert {:ok, []} =
@@ -29,6 +32,7 @@ defmodule RuvectorElixirTest do
   test "info/1 returns database metadata with atom keys", %{tmp_dir: tmp_dir} do
     db_path = Path.join(tmp_dir, "ruvector_info.rvf")
     assert {:ok, db_ref} = RuvectorElixir.open(db_path, 768)
+    on_exit(fn -> RuvectorElixir.close(db_ref) end)
     assert {:ok, info} = RuvectorElixir.info(db_ref)
 
     assert is_map(info)

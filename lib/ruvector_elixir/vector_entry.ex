@@ -14,7 +14,7 @@ defmodule RuvectorElixir.VectorEntry do
   @type t :: %__MODULE__{
           id: String.t() | nil,
           vector: [float()],
-          metadata: map() | nil
+          metadata: %{optional(String.t()) => term()} | nil
         }
 
   @doc """
@@ -26,7 +26,9 @@ defmodule RuvectorElixir.VectorEntry do
   ## Options
 
   - `:id` - Unique UTF-8 string identifier (or non-boolean atom / integer).
-  - `:metadata` - Plain map of JSON-serializable metadata attributes.
+  - `:metadata` - Plain map of JSON-serializable metadata attributes. Atom keys and
+    non-boolean/non-`nil` atom values are canonicalized to strings so `RuvectorElixir.get_struct/2`
+    round-trips identically.
 
   ## Examples
 
@@ -48,7 +50,7 @@ defmodule RuvectorElixir.VectorEntry do
     %{id: raw_id, metadata: raw_metadata} = extract_opts!(opts)
 
     %__MODULE__{
-      vector: normalize_vector!(vector),
+      vector: ensure_float_list!(vector),
       id: normalize_id!(raw_id),
       metadata: normalize_metadata!(raw_metadata)
     }
@@ -59,7 +61,7 @@ defmodule RuvectorElixir.VectorEntry do
     %{id: raw_id, metadata: raw_metadata} = extract_opts!(opts)
 
     %__MODULE__{
-      vector: normalize_vector!(vector),
+      vector: ensure_float_list!(vector),
       id: normalize_id!(raw_id),
       metadata: normalize_metadata!(raw_metadata)
     }
@@ -187,16 +189,34 @@ defmodule RuvectorElixir.VectorEntry do
   end
 
   defp normalize_vector!(vector) do
-    Enum.map(vector, &to_finite_f32_float!/1)
+    do_normalize_vector!(vector, [])
+  end
+
+  defp do_normalize_vector!([], acc), do: Enum.reverse(acc)
+
+  defp do_normalize_vector!([head | tail], acc) do
+    do_normalize_vector!(tail, [to_finite_f32_float!(head) | acc])
+  end
+
+  defp do_normalize_vector!(_improper_tail, _acc) do
+    raise ArgumentError, "Vector must be a proper list of numbers"
   end
 
   defp ensure_float_list!(vector) do
-    if Enum.all?(vector, &(is_float(&1) and finite_f32?(&1))) do
+    if all_finite_f32_floats?(vector) do
       vector
     else
       normalize_vector!(vector)
     end
   end
+
+  defp all_finite_f32_floats?([]), do: true
+
+  defp all_finite_f32_floats?([head | tail]) when is_float(head) do
+    finite_f32?(head) and all_finite_f32_floats?(tail)
+  end
+
+  defp all_finite_f32_floats?(_other), do: false
 
   # 2^128: integers at or above this magnitude overflow IEEE-754 f32 before f64 conversion.
   @f32_integer_overflow_bound 0x1_0000_0000_0000_0000_0000_0000_0000_0000
@@ -234,12 +254,108 @@ defmodule RuvectorElixir.VectorEntry do
     not match?(<<_::1, 255::8, _::23>>, <<val::float-32>>)
   end
 
+  @max_json_depth 127
+  @min_i64 -9_223_372_036_854_775_808
+  @max_u64 18_446_744_073_709_551_615
+
   defp normalize_metadata!(nil), do: nil
 
-  defp normalize_metadata!(%{} = metadata) when not is_struct(metadata), do: metadata
+  defp normalize_metadata!(%{} = metadata)
+       when not is_struct(metadata) and not is_map_key(metadata, :__struct__) do
+    normalize_json_map!(metadata, 1)
+  end
 
   defp normalize_metadata!(other) do
     raise ArgumentError,
           "VectorEntry :metadata must be a plain map or nil, got: #{inspect(other)}"
+  end
+
+  defp normalize_json_map!(map, depth) do
+    if depth > @max_json_depth do
+      raise ArgumentError,
+            "VectorEntry :metadata exceeds maximum nesting depth of #{@max_json_depth}"
+    end
+
+    Enum.reduce(map, %{}, fn {k, v}, acc ->
+      norm_k = normalize_metadata_key!(k)
+
+      if Map.has_key?(acc, norm_k) do
+        raise ArgumentError, "Duplicate VectorEntry :metadata key: #{inspect(norm_k)}"
+      end
+
+      Map.put(acc, norm_k, normalize_json_value!(v, depth))
+    end)
+  end
+
+  defp normalize_metadata_key!(k) when is_binary(k) do
+    if not String.valid?(k) do
+      raise ArgumentError, "VectorEntry :metadata keys must be valid UTF-8 strings"
+    end
+
+    k
+  end
+
+  defp normalize_metadata_key!(k)
+       when is_atom(k) and not is_boolean(k) and not is_nil(k) and k != :__struct__ do
+    Atom.to_string(k)
+  end
+
+  defp normalize_metadata_key!(other) do
+    raise ArgumentError,
+          "VectorEntry :metadata keys must be valid UTF-8 strings or non-boolean atoms, got: #{inspect(other)}"
+  end
+
+  defp normalize_json_value!(nil, _depth), do: nil
+  defp normalize_json_value!(val, _depth) when is_boolean(val), do: val
+  defp normalize_json_value!(val, _depth) when is_float(val), do: val
+
+  defp normalize_json_value!(val, _depth)
+       when is_integer(val) and val >= @min_i64 and val <= @max_u64,
+       do: val
+
+  defp normalize_json_value!(val, _depth) when is_integer(val) do
+    raise ArgumentError,
+          "VectorEntry :metadata integer out of 64-bit JSON range: #{inspect(val)}"
+  end
+
+  defp normalize_json_value!(val, _depth) when is_binary(val) do
+    if not String.valid?(val) do
+      raise ArgumentError, "VectorEntry :metadata strings must be valid UTF-8"
+    end
+
+    val
+  end
+
+  defp normalize_json_value!(val, _depth) when is_atom(val), do: Atom.to_string(val)
+
+  defp normalize_json_value!(val, depth) when is_list(val) do
+    next_depth = depth + 1
+
+    if next_depth > @max_json_depth do
+      raise ArgumentError,
+            "VectorEntry :metadata exceeds maximum nesting depth of #{@max_json_depth}"
+    end
+
+    normalize_json_list!(val, next_depth, [])
+  end
+
+  defp normalize_json_value!(%{} = map, depth)
+       when not is_struct(map) and not is_map_key(map, :__struct__) do
+    normalize_json_map!(map, depth + 1)
+  end
+
+  defp normalize_json_value!(other, _depth) do
+    raise ArgumentError,
+          "VectorEntry :metadata values must be JSON-compatible terms, got: #{inspect(other)}"
+  end
+
+  defp normalize_json_list!([], _item_depth, acc), do: Enum.reverse(acc)
+
+  defp normalize_json_list!([head | tail], item_depth, acc) do
+    normalize_json_list!(tail, item_depth, [normalize_json_value!(head, item_depth) | acc])
+  end
+
+  defp normalize_json_list!(_improper_tail, _item_depth, _acc) do
+    raise ArgumentError, "VectorEntry :metadata lists must be proper lists"
   end
 end

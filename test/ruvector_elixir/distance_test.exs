@@ -69,9 +69,13 @@ defmodule RuvectorElixir.DistanceTest do
       b = [1.0, 2.0, 3.0]
       assert {:ok, dist} = RuvectorElixir.distance(a, b, :euclidean)
       assert_in_delta dist, 0.0, 0.001
+
+      big = 10_000_000_000_000_000_000
+      assert {:ok, big_dist} = RuvectorElixir.distance([big, 0, 0, 0], [big, 0, 0, 0], :cosine)
+      assert_in_delta big_dist, 0.0, 0.001
     end
 
-    test "rejects unrecognized metric and non-finite vectors" do
+    test "rejects unrecognized metric, improper lists, and non-finite vectors" do
       assert_raise ArgumentError, ~r/Unsupported distance metric/, fn ->
         RuvectorElixir.distance([1.0, 0.0], [0.0, 1.0], :l2)
       end
@@ -82,6 +86,14 @@ defmodule RuvectorElixir.DistanceTest do
 
       assert_raise ArgumentError, ~r/non-empty/, fn ->
         RuvectorElixir.distance([], [], :euclidean)
+      end
+
+      assert_raise ArgumentError, ~r/proper lists/, fn ->
+        RuvectorElixir.distance([1.0 | 2.0], [1.0, 2.0], :cosine)
+      end
+
+      assert_raise ArgumentError, ~r/proper lists/, fn ->
+        RuvectorElixir.distance([1.0, 2.0], [1.0 | 2.0], :euclidean)
       end
 
       assert {:error, "Invalid vector a"} =
@@ -95,10 +107,18 @@ defmodule RuvectorElixir.DistanceTest do
       assert_in_delta dist, 0.0, 0.001
     end
 
-    test "distance! returns float or raises RuvectorElixir.Error" do
+    test "distance! returns float or raises ArgumentError / RuvectorElixir.Error" do
       a = [0.0, 0.0]
       b = [3.0, 4.0]
       assert RuvectorElixir.distance!(a, b, :euclidean) == 5.0
+
+      assert_raise ArgumentError, ~r/Invalid vector a/, fn ->
+        RuvectorElixir.distance!(["bad"], [1.0], :euclidean)
+      end
+
+      assert_raise ArgumentError, ~r/Invalid vector b/, fn ->
+        RuvectorElixir.distance!([1.0], [1.0e100], :euclidean)
+      end
 
       assert_raise RuvectorElixir.Error, fn ->
         RuvectorElixir.distance!([1.0], [1.0, 2.0], :euclidean)

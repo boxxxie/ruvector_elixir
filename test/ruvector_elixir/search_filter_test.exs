@@ -8,6 +8,7 @@ defmodule RuvectorElixir.SearchFilterTest do
   setup %{tmp_dir: tmp_dir} do
     db_path = Path.join(tmp_dir, "ruvector_filter.rvf")
     {:ok, db} = RuvectorElixir.open(db_path, 16)
+    on_exit(fn -> RuvectorElixir.close(db) end)
 
     entries =
       for i <- 0..49 do
@@ -99,6 +100,93 @@ defmodule RuvectorElixir.SearchFilterTest do
       query = for j <- 0..15, do: j * 0.1
       assert {:ok, results} = RuvectorElixir.search(db, query, 500)
       assert length(results) == 50
+
+      max_usize = Bitwise.bsl(1, :erlang.system_info(:wordsize) * 8) - 1
+
+      for huge_k <- [Bitwise.bsl(1, 50), max_usize, Bitwise.bsl(1, 100)] do
+        assert {:ok, unfiltered} = RuvectorElixir.search(db, query, huge_k)
+        assert length(unfiltered) == 50
+
+        assert {:ok, filtered} =
+                 RuvectorElixir.search_detailed(db, query, huge_k, filter: %{"decade" => 2})
+
+        assert length(filtered) == 10
+      end
+    end
+
+    test "huge k and ef_search clamp safely across Flat and HNSW memory/persistent DBs", %{
+      tmp_dir: tmp_dir
+    } do
+      max_usize = Bitwise.bsl(1, :erlang.system_info(:wordsize) * 8) - 1
+      huge_values = [Bitwise.bsl(1, 50), max_usize, Bitwise.bsl(1, 100)]
+
+      targets = [
+        {"memory://huge_k_flat", [metric: :euclidean, hnsw: false]},
+        {"memory://huge_k_hnsw", [metric: :euclidean, hnsw: [m: 16, ef_search: 16]]},
+        {Path.join(tmp_dir, "huge_k_flat.rvf"), [metric: :euclidean, hnsw: false]},
+        {Path.join(tmp_dir, "huge_k_hnsw.rvf"),
+         [metric: :euclidean, hnsw: [m: 16, ef_search: 16]]}
+      ]
+
+      for {path, opts} <- targets do
+        {:ok, handle} = RuvectorElixir.open(path, 4, opts)
+
+        assert {:ok, _} =
+                 RuvectorElixir.insert_batch(handle, [
+                   %{id: "a", vector: [1.0, 0.0, 0.0, 0.0], metadata: %{"tag" => "x"}},
+                   %{id: "b", vector: [0.0, 1.0, 0.0, 0.0], metadata: %{"tag" => "y"}}
+                 ])
+
+        for huge_k <- huge_values do
+          assert {:ok, ids} = RuvectorElixir.search(handle, [1.0, 0.0, 0.0, 0.0], huge_k)
+          assert Enum.sort(ids) == ["a", "b"]
+
+          assert {:ok, detailed} =
+                   RuvectorElixir.search_detailed(handle, [1.0, 0.0, 0.0, 0.0], huge_k,
+                     filter: %{"tag" => "x"}
+                   )
+
+          assert Enum.map(detailed, & &1.id) == ["a"]
+        end
+
+        assert {:ok, ["a", "b"]} =
+                 RuvectorElixir.search(handle, [1.0, 0.0, 0.0, 0.0], 2,
+                   ef_search: Bitwise.bsl(1, 50)
+                 )
+
+        assert :ok = RuvectorElixir.close(handle)
+      end
+    end
+
+    test "accepts string-keyed search option maps and rejects duplicate atom/string option keys",
+         %{
+           db: db
+         } do
+      query = for j <- 0..15, do: j * 0.1
+
+      assert {:ok, ids} =
+               RuvectorElixir.search(db, query, 5, %{
+                 "filter" => %{"decade" => 2},
+                 "ef_search" => 32
+               })
+
+      assert length(ids) == 5
+
+      assert {:ok, detailed} =
+               RuvectorElixir.search_detailed(db, query, 5, %{
+                 "filter" => [decade: 2],
+                 "ef_search" => 32
+               })
+
+      assert Enum.all?(detailed, &(&1.metadata["decade"] == 2))
+
+      assert_raise ArgumentError, ~r/Duplicate search option/, fn ->
+        RuvectorElixir.search(db, query, 5, %{:filter => %{}, "filter" => %{}})
+      end
+
+      assert_raise ArgumentError, ~r/Duplicate search option/, fn ->
+        RuvectorElixir.search_detailed(db, query, 5, %{:ef_search => 10, "ef_search" => 20})
+      end
     end
 
     test "search with k = 1 returns exactly the single closest element", %{db: db} do
@@ -111,6 +199,7 @@ defmodule RuvectorElixir.SearchFilterTest do
       nil_db_path = Path.join(tmp_dir, "ruvector_nil_meta.rvf")
 
       assert {:ok, db} = RuvectorElixir.open(nil_db_path, 3)
+      on_exit(fn -> RuvectorElixir.close(db) end)
 
       assert {:ok, "v_no_meta"} =
                RuvectorElixir.insert(db, %{id: "v_no_meta", vector: [1.0, 2.0, 3.0]})
@@ -228,6 +317,7 @@ defmodule RuvectorElixir.SearchFilterTest do
     test "insert and search 500 vectors", %{tmp_dir: tmp_dir} do
       db_path = Path.join(tmp_dir, "ruvector_scale.rvf")
       {:ok, db} = RuvectorElixir.open(db_path, 32)
+      on_exit(fn -> RuvectorElixir.close(db) end)
 
       batch =
         for i <- 0..499 do
