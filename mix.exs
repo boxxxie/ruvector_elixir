@@ -63,7 +63,9 @@ defmodule RuvectorElixir.MixProject do
     [
       precommit: [
         "format --check-formatted",
-        "compile --warnings-as-errors",
+        "cmd cargo fmt --manifest-path native/ruvector_nif/Cargo.toml --check",
+        "cmd cargo clippy --manifest-path native/ruvector_nif/Cargo.toml -- -D warnings",
+        "compile --force --warnings-as-errors",
         "test"
       ]
     ]
