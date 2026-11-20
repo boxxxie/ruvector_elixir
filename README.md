@@ -6,7 +6,7 @@
 [![Elixir](https://img.shields.io/badge/Elixir-~%3E%201.18-4B275F.svg?logo=elixir&logoColor=white)](https://elixir-lang.org)
 [![Rust](https://img.shields.io/badge/Rust-1.91%2B-DEA584.svg?logo=rust&logoColor=black)](https://www.rust-lang.org)
 [![Rustler](https://img.shields.io/badge/Rustler-0.38-CE422B.svg)](https://github.com/rusterlium/rustler)
-[![ruvector-core](https://img.shields.io/badge/ruvector--core-2.3.0-0EA5E9.svg)](https://github.com/ruvnet/ruvector)
+[![ruvector-core](https://img.shields.io/badge/ruvector--core-2.5.2-0EA5E9.svg)](https://github.com/ruvnet/ruvector)
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 
 Official Elixir bindings for [**ruvector**](https://github.com/ruvnet/ruvector), an ultra-fast embedded vector database and GraphRAG metadata engine written in Rust.
@@ -185,7 +185,7 @@ v2 = [0.0, 1.0, 0.0]
 | :--- | :--- | :--- | :--- |
 | `:metric` / `:distance_metric` | atom / string | `:cosine` | Distance metric (`:cosine`, `:euclidean`, `:dot_product`, `:manhattan`). |
 | `:hnsw` | boolean / map / keyword | `nil` | `true` for default HNSW, `false` for flat index, or map/keyword with tuning parameters (see below). |
-| `:quantization` | atom / string / map / keyword | `nil` | `:none`, `:scalar`, `:binary`, or `%{type: :product, subspaces: pos_integer(), k: pos_integer()}` where `subspaces` divides `dimensions`. Persisted/reported in `info/1`; `ruvector-core` 2.3.0 stores vectors in `f32` precision. |
+| `:quantization` | atom / string / map / keyword | `nil` | `:none`, `:scalar`, `:binary`, or `%{type: :product, subspaces: pos_integer(), k: pos_integer()}` where `subspaces` divides `dimensions`. Persisted/reported in `info/1`; `ruvector-core` 2.5.2 stores vectors in `f32` precision for these variants. |
 
 ### HNSW Configuration
 

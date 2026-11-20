@@ -5,8 +5,8 @@ use ruvector_core::index::flat::FlatIndex;
 use ruvector_core::index::hnsw::HnswIndex;
 use ruvector_core::index::VectorIndex;
 use ruvector_core::types::{
-    DbOptions, DistanceMetric, HnswConfig, QuantizationConfig, SearchQuery, SearchResult,
-    VectorEntry,
+    DbOptions, DistanceMetric, HnswConfig, QuantizationConfig, SearchPolicy, SearchQuantization,
+    SearchQuery, SearchResult, VectorEntry,
 };
 use ruvector_core::VectorDB;
 use std::collections::{HashMap, HashSet};
@@ -805,6 +805,16 @@ rustler::atoms! {
     ef_construction,
     ef_search,
     max_elements,
+    turbo4,
+    rotation_seed,
+    rescore_multiplier,
+    policy,
+    search_quantization,
+    quality,
+    balanced,
+    max_compression,
+    turbo4_direct,
+    rabitq1,
 }
 
 enum DbAccessError {
@@ -1875,6 +1885,29 @@ fn encode_quantization_term<'a>(env: Env<'a>, quant: Option<&QuantizationConfig>
             subspaces() => *sub,
             k() => *k_size,
         }),
+        Some(QuantizationConfig::Turbo4 {
+            rotation_seed: seed,
+            rescore_multiplier: multiplier,
+            policy: search_policy,
+            search_quantization: search_quant,
+        }) => {
+            let policy_atom = match search_policy {
+                SearchPolicy::Quality => quality(),
+                SearchPolicy::Balanced => balanced(),
+                SearchPolicy::MaxCompression => max_compression(),
+            };
+            let search_quant_atom = match search_quant {
+                SearchQuantization::Turbo4Direct => turbo4_direct(),
+                SearchQuantization::RaBitQ1 => rabitq1(),
+            };
+            rustler::term_map!(env, {
+                type_() => turbo4(),
+                rotation_seed() => *seed,
+                rescore_multiplier() => *multiplier,
+                policy() => policy_atom,
+                search_quantization() => search_quant_atom,
+            })
+        }
     }
 }
 

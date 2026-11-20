@@ -101,6 +101,13 @@ defmodule RuvectorElixir do
             | :scalar
             | :binary
             | %{type: :product, subspaces: pos_integer(), k: pos_integer()}
+            | %{
+                type: :turbo4,
+                rotation_seed: non_neg_integer(),
+                rescore_multiplier: pos_integer(),
+                policy: :quality | :balanced | :max_compression,
+                search_quantization: :turbo4_direct | :rabitq1
+              }
             | nil
         }
 
@@ -130,7 +137,7 @@ defmodule RuvectorElixir do
     - `:ef_search` - Size of dynamic candidate list during search (`1..1_000_000`, default: `100`).
     - `:max_elements` - Initial capacity of the graph index (`1..10_000_000`, default: `1_000_000`).
   - `:quantization` - Optional quantization configuration (`:scalar`, `:binary`, `:none`, or `%{type: :product, subspaces: pos_integer(), k: pos_integer()}` where `subspaces` must evenly divide `dimensions`).
-    Note: upstream `ruvector-core` 2.3.0 persists and reports `:quantization` in config/info, but stores vectors in `f32` precision without applying compression yet (`ruvnet/RuVector#563`).
+    Note: upstream `ruvector-core` 2.5.2 persists and reports `:scalar`, `:binary`, and `:product` in config/info while storing vectors in `f32` precision without applying compression yet (`ruvnet/RuVector#563`).
 
   Vectors are stored internally as 32-bit IEEE 754 floats (`f32`); non-dyadic 64-bit Elixir floats
   are rounded to `f32` precision on insert and widened back to `f64` on read.
