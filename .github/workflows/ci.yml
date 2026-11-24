@@ -16,6 +16,7 @@ jobs:
     runs-on: ubuntu-latest
     env:
       CARGO_TARGET_DIR: ${{ github.workspace }}/native/ruvector_nif/target
+      RUVECTOR_BUILD: "true"
     strategy:
       fail-fast: false
       matrix:

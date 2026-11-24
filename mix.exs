@@ -1,7 +1,7 @@
 defmodule RuvectorElixir.MixProject do
   use Mix.Project
 
-  @version "0.2.1"
+  @version "0.2.2"
   @source_url "https://github.com/boxxxie/ruvector_elixir"
 
   def project do
@@ -51,6 +51,7 @@ defmodule RuvectorElixir.MixProject do
         "native/ruvector_nif/Cargo.toml",
         "native/ruvector_nif/Cargo.lock",
         "native/ruvector_nif/README.md",
+        "checksum-*.exs",
         "usage-rules.md",
         "mix.exs",
         ".formatter.exs",
@@ -63,7 +64,9 @@ defmodule RuvectorElixir.MixProject do
 
   defp aliases do
     [
+      test: [fn _ -> System.put_env("RUVECTOR_BUILD", "true") end, "test"],
       precommit: [
+        fn _ -> System.put_env("RUVECTOR_BUILD", "true") end,
         "format --check-formatted",
         "cmd cargo fmt --manifest-path native/ruvector_nif/Cargo.toml --check",
         "cmd cargo clippy --manifest-path native/ruvector_nif/Cargo.toml -- -D warnings",
@@ -85,7 +88,8 @@ defmodule RuvectorElixir.MixProject do
   # Run "mix help deps" to learn about dependencies.
   defp deps do
     [
-      {:rustler, "~> 0.38.0", runtime: false},
+      {:rustler_precompiled, "~> 0.9"},
+      {:rustler, "~> 0.38.0", optional: true, runtime: false},
       {:ex_doc, ">= 0.0.0", only: :dev, runtime: false}
     ]
   end

@@ -1,7 +1,27 @@
 defmodule RuvectorElixir.Native do
   @moduledoc false
 
-  use Rustler, otp_app: :ruvector_elixir, crate: "ruvector_nif"
+  mix_config = Mix.Project.config()
+  version = mix_config[:version]
+  source_url = mix_config[:source_url]
+
+  targets = ~w(
+    aarch64-apple-darwin
+    aarch64-unknown-linux-gnu
+    x86_64-apple-darwin
+    x86_64-unknown-linux-gnu
+  )
+
+  nif_versions = ~w(2.16)
+
+  use RustlerPrecompiled,
+    otp_app: :ruvector_elixir,
+    crate: "ruvector_nif",
+    base_url: "#{source_url}/releases/download/v#{version}",
+    force_build: System.get_env("RUVECTOR_BUILD") in ["1", "true"],
+    version: version,
+    targets: targets,
+    nif_versions: nif_versions
 
   @spec open_db_with_options(String.t(), pos_integer(), %{optional(String.t()) => term()} | nil) ::
           {:ok, reference()} | {:error, String.t()}
